@@ -161,12 +161,9 @@ fi
 # ── Wrapper ───────────────────────────────────────────────────────────────────
 cat > /usr/local/bin/scan-and-report <<WRAPPER
 #!/usr/bin/env bash
-OUTPUT_DIR="\${1:-/tmp/scan_output}"
-REPORT="\${2:-/tmp/security_report.xlsx}"
-PORT="\${3:-5000}"
+PORT="\${1:-5000}"
 
-SCAN_DIR="\$OUTPUT_DIR" \
-REPORT_PATH="\$REPORT" \
+SCAN_BASE="/var/lib/vulnscanner/scans" \
 INSTALL_DIR="$INSTALL_DIR" \
 PORT="\$PORT" \
 $INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/webserver.py
