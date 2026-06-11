@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/YOURUSER/YOURREPO/main"
+REPO_RAW="https://raw.githubusercontent.com/KennethDhoe/vulnscanner/main"
 INSTALL_DIR="/opt/syft-grype-report"
 
 # ── Detect distro ─────────────────────────────────────────────────────────────
