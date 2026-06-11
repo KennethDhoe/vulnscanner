@@ -222,16 +222,27 @@ def status():
             "stage":   state["stage"],
         })
 
-@app.route("/log")
-def get_log():
-    with state_lock:
-        return jsonify({
-            "lines":   state["log"],
-            "done":    state["done"],
-            "running": state["running"],
-            "error":   state["error"],
-            "stage":   state["stage"],
-        })
+@app.route("/stream")
+def stream():
+    def generate():
+        sent = 0
+        yield ": connected\n\n"
+        while True:
+            with state_lock:
+                lines = state["log"][sent:]
+                sent += len(lines)
+                done  = state["done"]
+            for line in lines:
+                yield f"data: {line.replace(chr(10), ' ')}\n\n"
+            if done and not lines:
+                yield "event: done\ndata: \n\n"
+                break
+            yield ": ping\n\n"
+            time.sleep(0.5)
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 @app.route("/summary")
 def summary():
@@ -561,10 +572,9 @@ PAGE = """<!DOCTYPE html>
 </div>
 
 <script>
-let allVulns    = [];
-let autoscroll  = true;
-let pollTimer   = null;
-let lastLineIdx = 0;
+let allVulns   = [];
+let autoscroll = true;
+let evtSource  = null;
 
 const STAGE_ORDER = ['meta','syft','grype','containers','report','done'];
 
@@ -576,16 +586,15 @@ window.onload = () => {
     if (d.running) {
       // Scan already in progress — jump straight to scan screen and resume polling
       document.getElementById('screen-home').style.display = 'none';
-      document.getElementById('screen-scan').style.display = '';
+      document.getElementById('screen-scan').style.display = 'block';
       document.getElementById('results-panel').style.display = 'none';
       document.getElementById('log-box').innerHTML = '';
-      lastLineIdx = 0;
       setBadge('running');
       setProgress(d.stage || 'syft', getStagePercent(d.stage), getStageName(d.stage));
-      startPolling();
+      connectStream();
     } else if (d.done) {
       // Previous scan finished — show results button
-      document.getElementById('results-btn').style.display = '';
+      document.getElementById('results-btn').style.display = 'block';
       setBadge('done');
     }
   });
@@ -604,13 +613,13 @@ function getStageName(stage) {
 
 // ── Screen switching ─────────────────────────────────────────────────────────
 function showHome() {
-  document.getElementById('screen-home').style.display = '';
+  document.getElementById('screen-home').style.display = 'block';
   document.getElementById('screen-scan').style.display = 'none';
 }
 function showResults() {
   document.getElementById('screen-home').style.display = 'none';
-  document.getElementById('screen-scan').style.display = '';
-  document.getElementById('results-panel').style.display = '';
+  document.getElementById('screen-scan').style.display = 'block';
+  document.getElementById('results-panel').style.display = 'block';
   loadSummary();
 }
 
@@ -618,7 +627,7 @@ function showResults() {
 function startScan() {
   document.getElementById('start-btn').disabled = true;
   document.getElementById('screen-home').style.display = 'none';
-  document.getElementById('screen-scan').style.display = '';
+  document.getElementById('screen-scan').style.display = 'block';
   document.getElementById('results-panel').style.display = 'none';
   document.getElementById('log-box').innerHTML = '';
   lastLineIdx = 0;
@@ -629,55 +638,56 @@ function startScan() {
     .then(r => r.json())
     .then(d => {
       if (d.error) { alert(d.error); showHome(); return; }
-      startPolling();
+      connectStream();
     })
     .catch(e => { alert('Failed to start: ' + e); showHome(); });
 }
 
-// ── Polling ──────────────────────────────────────────────────────────────────
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  lastLineIdx = 0;
-  pollTimer = setInterval(pollLog, 800);
-}
+// ── SSE ───────────────────────────────────────────────────────────────────────
+function connectStream() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource('/stream');
 
-function pollLog() {
-  fetch('/log')
-    .then(r => r.json())
-    .then(d => {
-      // Render any new lines since last poll
-      const newLines = d.lines.slice(lastLineIdx);
-      lastLineIdx = d.lines.length;
+  evtSource.onmessage = (e) => {
+    const line = e.data;
+    if (!line) return;
 
-      newLines.forEach(line => {
-        if (line.startsWith('__STAGE__')) {
-          const parts = line.split('__').filter(Boolean);
-          const stage = parts[1];
-          const pct   = parseInt(parts[2]);
-          const label = parts[3];
-          setProgress(stage, pct, label);
-          appendLog('▶ ' + label, 'stage');
-        } else {
-          appendLog(line);
-        }
-      });
+    if (line.startsWith('__STAGE__')) {
+      const parts = line.split('__').filter(Boolean);
+      const stage = parts[1];
+      const pct   = parseInt(parts[2]);
+      const label = parts[3];
+      setProgress(stage, pct, label);
+      appendLog('▶ ' + label, 'stage');
+      return;
+    }
 
-      // Scan finished
-      if (d.done) {
-        clearInterval(pollTimer);
-        if (d.error) {
-          setBadge('error');
-          setProgress('done', 100, 'Finished with errors');
-        } else {
-          setBadge('done');
-          setProgress('done', 100, 'Complete');
-          document.getElementById('results-panel').style.display = '';
-          loadSummary();
-        }
-        document.getElementById('start-btn').disabled = false;
+    appendLog(line);
+  };
+
+  evtSource.addEventListener('done', () => {
+    evtSource.close();
+    fetch('/status').then(r => r.json()).then(d => {
+      if (d.error) {
+        setBadge('error');
+        setProgress('done', 100, 'Finished with errors');
+      } else {
+        setBadge('done');
+        setProgress('done', 100, 'Complete');
+        document.getElementById('results-panel').style.display = 'block';
+        loadSummary();
       }
-    })
-    .catch(() => {}); // silently retry next tick
+      document.getElementById('start-btn').disabled = false;
+    });
+  });
+
+  evtSource.onerror = () => {
+    setTimeout(() => {
+      fetch('/status').then(r => r.json()).then(d => {
+        if (d.running) connectStream();
+      }).catch(() => {});
+    }, 2000);
+  };
 }
 
 function appendLog(text, cls) {
