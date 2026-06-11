@@ -226,19 +226,22 @@ def status():
 def stream():
     def generate():
         sent = 0
-        yield ": connected\n\n"
-        while True:
-            with state_lock:
-                lines = state["log"][sent:]
-                sent += len(lines)
-                done  = state["done"]
-            for line in lines:
-                yield f"data: {line.replace(chr(10), ' ')}\n\n"
-            if done and not lines:
-                yield "event: done\ndata: \n\n"
-                break
-            yield ": ping\n\n"
-            time.sleep(0.5)
+        try:
+            yield ": connected\n\n"
+            while True:
+                with state_lock:
+                    lines = state["log"][sent:]
+                    sent += len(lines)
+                    done  = state["done"]
+                for line in lines:
+                    yield f"data: {line.replace(chr(10), ' ')}\n\n"
+                if done and not lines:
+                    yield "event: done\ndata: \n\n"
+                    break
+                yield ": ping\n\n"
+                time.sleep(0.5)
+        except GeneratorExit:
+            pass  # client disconnected cleanly
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no",
