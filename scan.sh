@@ -22,13 +22,7 @@ echo "[*] Collecting host metadata..."
 
 # ── Host SBOM (Syft) ─────────────────────────────────────────────────────────
 echo "[*] Scanning host filesystem with Syft..."
-syft / \
-  --scope all-layers \
-  --exclude '**/proc/**' \
-  --exclude '**/sys/**' \
-  --exclude '**/dev/**' \
-  --exclude '**/run/**' \
-  --exclude '**/tmp/**' \
+syft packages:/ \
   -o syft-json \
   > "$OUTPUT_DIR/host_sbom.json"
 
