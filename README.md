@@ -7,6 +7,6 @@ Scans a linux host for software and creates a xlsx/pdf report
 
 # Run it
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/KennethDhoe/vulnscanner/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/KennethDhoe/vulnscanner/main/run.sh)
 ```
 
