@@ -13,60 +13,106 @@ detect_distro() {
   if [ -f /etc/os-release ]; then
     . /etc/os-release
     echo "${ID_LIKE:-$ID}"
-  elif command -v apk &>/dev/null;  then echo "alpine"
+  elif command -v apk &>/dev/null;    then echo "alpine"
   elif command -v apt-get &>/dev/null; then echo "debian"
-  elif command -v dnf &>/dev/null;  then echo "fedora"
-  elif command -v yum &>/dev/null;  then echo "rhel"
+  elif command -v dnf &>/dev/null;    then echo "fedora"
+  elif command -v yum &>/dev/null;    then echo "rhel"
   elif command -v pacman &>/dev/null; then echo "arch"
   elif command -v zypper &>/dev/null; then echo "suse"
-  else
-    echo "unknown"
+  else echo "unknown"
   fi
 }
 
 DISTRO=$(detect_distro)
 echo "[*] Detected distro family: $DISTRO"
 
+# ── List packages (shown to user before install) ──────────────────────────────
+list_deps() {
+  case "$DISTRO" in
+    *debian*|*ubuntu*)
+      echo "  curl, python3, python3-pip, python3-full, python3-venv"
+      echo "  libpango-1.0-0, libpangoft2-1.0-0, libpangocairo-1.0-0"
+      echo "  libgdk-pixbuf2.0-0, libffi-dev, shared-mime-info, fonts-liberation"
+      ;;
+    *fedora*|*rhel*|*centos*)
+      echo "  curl, python3, python3-pip, python3-virtualenv"
+      echo "  pango, gdk-pixbuf2, libffi, shared-mime-info"
+      echo "  levien-inconsolata-fonts, google-noto-fonts-common"
+      ;;
+    *alpine*)
+      echo "  curl, python3, py3-pip, py3-virtualenv"
+      echo "  pango, gdk-pixbuf, fontconfig, ttf-liberation, shared-mime-info"
+      ;;
+    *arch*)
+      echo "  curl, python, python-pip, python-virtualenv"
+      echo "  pango, gdk-pixbuf2, shared-mime-info, ttf-liberation"
+      ;;
+    *suse*|*opensuse*)
+      echo "  curl, python3, python3-pip, python3-virtualenv"
+      echo "  pango, gdk-pixbuf, libffi, shared-mime-info, fonts-liberation2"
+      ;;
+    *)
+      echo "  curl, python3, python3-venv, pango, gdk-pixbuf, libffi"
+      ;;
+  esac
+  echo ""
+  echo "  Python packages (isolated venv):"
+  echo "  openpyxl, weasyprint"
+  echo ""
+  echo "  Tools (installed to /usr/local/bin):"
+  echo "  syft, grype"
+}
+
 # ── Install system packages ───────────────────────────────────────────────────
 install_deps() {
   case "$DISTRO" in
     *debian*|*ubuntu*)
       apt-get update -qq
-      apt-get install -y -q \
+      apt-get install -y \
         curl python3 python3-pip python3-full python3-venv \
         libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
         libgdk-pixbuf2.0-0 libffi-dev shared-mime-info fonts-liberation
       ;;
     *fedora*|*rhel*|*centos*)
-      PKG="dnf"
-      command -v dnf &>/dev/null || PKG="yum"
-      $PKG install -y -q \
+      PKG="dnf"; command -v dnf &>/dev/null || PKG="yum"
+      $PKG install -y \
         curl python3 python3-pip python3-virtualenv \
         pango gdk-pixbuf2 libffi shared-mime-info \
         levien-inconsolata-fonts google-noto-fonts-common
       ;;
     *alpine*)
-      apk add --quiet --no-cache \
+      apk add --no-cache \
         curl python3 py3-pip py3-virtualenv \
         pango gdk-pixbuf fontconfig ttf-liberation shared-mime-info
       ;;
     *arch*)
-      pacman -Sy --noconfirm --quiet \
+      pacman -Sy --noconfirm \
         curl python python-pip python-virtualenv \
         pango gdk-pixbuf2 shared-mime-info ttf-liberation
       ;;
     *suse*|*opensuse*)
-      zypper install -y -q \
+      zypper install -y \
         curl python3 python3-pip python3-virtualenv \
         pango gdk-pixbuf libffi shared-mime-info fonts-liberation2
       ;;
     *)
       echo "[!] Unknown distro — skipping system package install."
-      echo "    Make sure these are installed manually:"
-      echo "    curl, python3, python3-venv, pango, gdk-pixbuf, libffi"
+      echo "    Install manually: curl, python3, python3-venv, pango, gdk-pixbuf, libffi"
       ;;
   esac
 }
+
+# ── Confirm before proceeding ─────────────────────────────────────────────────
+echo ""
+echo "The following will be installed on this system:"
+echo "────────────────────────────────────────────────"
+list_deps
+echo "────────────────────────────────────────────────"
+read -r -p "Continue? [y/N] " confirm
+case "$confirm" in
+  [yY][eE][sS]|[yY]) ;;
+  *) echo "Aborted."; exit 1 ;;
+esac
 
 echo "[*] Installing system dependencies..."
 install_deps
@@ -126,14 +172,11 @@ chmod +x /usr/local/bin/scan-and-report
 echo "[*] Updating Grype vulnerability database..."
 grype db update
 
-echo ""
-echo "════════════════════════════════════════════"
-echo " Installation complete."
-echo ""
-echo " Run a full scan:   scan-and-report"
-echo " Custom paths:      scan-and-report /tmp/out /tmp/my_report"
-echo "════════════════════════════════════════════"
-
 # ── Run scan ──────────────────────────────────────────────────────────────────
 echo "[*] Starting scan..."
 scan-and-report
+
+echo ""
+echo "════════════════════════════════════════════"
+echo " Done. Re-run anytime with: scan-and-report"
+echo "════════════════════════════════════════════"
