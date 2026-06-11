@@ -661,10 +661,15 @@ function connectStream() {
     const line = e.data;
     if (!line || line.startsWith(': ')) return; // SSE comments/keepalives
 
+    // Clear placeholder on first real message of any kind
+    if (!logReady) {
+      document.getElementById('log-box').innerHTML = '';
+      logReady = true;
+    }
+
     // Stage control messages
     if (line.startsWith('__STAGE__')) {
       const parts = line.split('__').filter(Boolean);
-      // parts: ['STAGE', stageName, pct, label]
       const stage = parts[1];
       const pct   = parseInt(parts[2]);
       const label = parts[3];
@@ -673,10 +678,6 @@ function connectStream() {
       return;
     }
 
-    if (!logReady) {
-      document.getElementById('log-box').innerHTML = '';
-      logReady = true;
-    }
     appendLog(line);
   };
 
