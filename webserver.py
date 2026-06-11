@@ -588,9 +588,35 @@ window.onload = () => {
   document.getElementById('home-hostinfo').innerHTML =
     'Host: <span>' + location.hostname + '</span>';
   fetch('/status').then(r => r.json()).then(d => {
-    if (d.done) document.getElementById('results-btn').style.display = '';
+    if (d.running) {
+      // Scan already in progress — jump straight to scan screen and reconnect
+      document.getElementById('screen-home').style.display = 'none';
+      document.getElementById('screen-scan').style.display = '';
+      document.getElementById('results-panel').style.display = 'none';
+      document.getElementById('log-box').innerHTML =
+        '<span style="color:#555">Reconnecting to running scan...</span>';
+      logReady = false;
+      setBadge('running');
+      setProgress(d.stage || 'syft', getStagePercent(d.stage), getStageName(d.stage));
+      connectStream();
+    } else if (d.done) {
+      // Previous scan finished — show results button
+      document.getElementById('results-btn').style.display = '';
+      setBadge('done');
+    }
   });
 };
+
+function getStagePercent(stage) {
+  const map = {idle:0,meta:5,syft:20,grype:55,containers:70,report:90,done:100};
+  return map[stage] || 10;
+}
+function getStageName(stage) {
+  const map = {idle:'Idle',meta:'Collecting host info',syft:'Building SBOM',
+               grype:'Scanning vulnerabilities',containers:'Scanning containers',
+               report:'Generating report',done:'Complete'};
+  return map[stage] || 'Running';
+}
 
 // ── Screen switching ─────────────────────────────────────────────────────────
 function showHome() {
