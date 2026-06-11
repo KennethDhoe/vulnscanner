@@ -26,8 +26,25 @@ state = {
     "done":    False,
     "running": False,
     "error":   False,
+    "stage":   "idle",   # idle | meta | syft | grype | containers | report | done
 }
 state_lock = threading.Lock()
+
+STAGES = {
+    "idle":       ("Idle",                   0),
+    "meta":       ("Collecting host info",   5),
+    "syft":       ("Building SBOM (Syft)",  20),
+    "grype":      ("Scanning vulns (Grype)", 55),
+    "containers": ("Scanning containers",   70),
+    "report":     ("Generating report",     90),
+    "done":       ("Complete",             100),
+}
+
+def set_stage(s):
+    with state_lock:
+        state["stage"] = s
+        label, pct = STAGES.get(s, ("Running", 50))
+        state["log"].append(f"__STAGE__{s}__{pct}__{label}")
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 def load_json(path):
@@ -70,10 +87,10 @@ def parse_vulns(vuln_json, source="host"):
     return vulns
 
 def get_summary():
-    meta      = load_host_meta()
-    host_vj   = load_json(os.path.join(SCAN_DIR, "host_vulns.json"))
-    host_sbom = load_json(os.path.join(SCAN_DIR, "host_sbom.json"))
-    host_pkgs = len(host_sbom.get("artifacts", [])) if host_sbom else 0
+    meta       = load_host_meta()
+    host_vj    = load_json(os.path.join(SCAN_DIR, "host_vulns.json"))
+    host_sbom  = load_json(os.path.join(SCAN_DIR, "host_sbom.json"))
+    host_pkgs  = len(host_sbom.get("artifacts", [])) if host_sbom else 0
     host_vulns = parse_vulns(host_vj, "host")
 
     container_vulns = []
@@ -81,11 +98,11 @@ def get_summary():
     containers_dir  = os.path.join(SCAN_DIR, "containers")
     if os.path.isdir(containers_dir):
         for sbom_path in glob.glob(os.path.join(containers_dir, "*_sbom.json")):
-            base     = sbom_path.replace("_sbom.json", "")
-            img_name = os.path.basename(base).replace("___", "/", 1).replace("___", ":")
-            vj       = load_json(base + "_vulns.json")
-            vulns    = parse_vulns(vj, img_name)
-            sbom     = load_json(sbom_path)
+            base      = sbom_path.replace("_sbom.json", "")
+            img_name  = os.path.basename(base).replace("___", "/", 1).replace("___", ":")
+            vj        = load_json(base + "_vulns.json")
+            vulns     = parse_vulns(vj, img_name)
+            sbom      = load_json(sbom_path)
             pkg_count = len(sbom.get("artifacts", [])) if sbom else 0
             container_vulns += vulns
             containers.append({
@@ -96,8 +113,8 @@ def get_summary():
                 "high":     sum(1 for v in vulns if v["severity"] == "High"),
             })
 
-    all_vulns  = host_vulns + container_vulns
-    sev_order  = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Negligible": 4, "Unknown": 5}
+    all_vulns = host_vulns + container_vulns
+    sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Negligible": 4, "Unknown": 5}
 
     return {
         "meta":       meta,
@@ -118,12 +135,17 @@ def run_scan():
     venv_python = os.path.join(INSTALL_DIR, "venv", "bin", "python3")
     os.makedirs(SCAN_DIR, exist_ok=True)
 
-    commands = [
-        ["bash", os.path.join(INSTALL_DIR, "scan.sh"), SCAN_DIR],
-        [venv_python, os.path.join(INSTALL_DIR, "generate_report.py"), SCAN_DIR, REPORT_PATH],
-    ]
+    # Stage keywords to detect from output
+    stage_triggers = {
+        "Collecting host metadata":  "meta",
+        "Scanning host filesystem":  "syft",
+        "Scanning host SBOM":        "grype",
+        "Docker detected":           "containers",
+        "Scanning images":           "containers",
+        "Generating report":         "report",
+    }
 
-    for cmd in commands:
+    def stream_cmd(cmd):
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -131,24 +153,46 @@ def run_scan():
             text=True,
             bufsize=1,
         )
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                with state_lock:
-                    state["log"].append(line)
-        proc.wait()
-        if proc.returncode != 0:
+        for raw in proc.stdout:
+            line = raw.rstrip()
+            if not line:
+                continue
+            # Detect stage from output
+            for trigger, stage in stage_triggers.items():
+                if trigger.lower() in line.lower():
+                    set_stage(stage)
+                    break
             with state_lock:
-                state["log"].append(f"[✗] Command failed with exit code {proc.returncode}")
+                state["log"].append(line)
+        proc.wait()
+        return proc.returncode
+
+    set_stage("meta")
+
+    rc1 = stream_cmd(["bash", os.path.join(INSTALL_DIR, "scan.sh"), SCAN_DIR])
+    if rc1 != 0:
+        with state_lock:
+            state["log"].append(f"[✗] scan.sh failed (exit {rc1})")
+            state["error"] = True
+
+    if not state["error"]:
+        set_stage("report")
+        rc2 = stream_cmd([venv_python,
+                          os.path.join(INSTALL_DIR, "generate_report.py"),
+                          SCAN_DIR, REPORT_PATH])
+        if rc2 != 0:
+            with state_lock:
+                state["log"].append(f"[✗] generate_report.py failed (exit {rc2})")
                 state["error"] = True
 
+    set_stage("done")
     with state_lock:
         state["done"]    = True
         state["running"] = False
         if not state["error"]:
-            state["log"].append("[✓] Scan complete. Report is ready for download.")
+            state["log"].append("[✓] All done. Report is ready for download.")
         else:
-            state["log"].append("[✗] Scan finished with errors. Check the log above.")
+            state["log"].append("[✗] Scan finished with errors. Check log above.")
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -164,6 +208,7 @@ def start_scan():
         state["done"]    = False
         state["running"] = True
         state["error"]   = False
+        state["stage"]   = "idle"
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"ok": True})
 
@@ -174,29 +219,34 @@ def status():
             "running": state["running"],
             "done":    state["done"],
             "error":   state["error"],
+            "stage":   state["stage"],
         })
 
 @app.route("/stream")
 def stream():
     def generate():
         sent = 0
+        # Send a keepalive comment immediately so the browser knows the connection is alive
+        yield ": connected\n\n"
         while True:
             with state_lock:
                 lines   = state["log"][sent:]
                 sent   += len(lines)
                 done    = state["done"]
-                running = state["running"]
             for line in lines:
-                yield f"data: {line}\n\n"
+                # Escape newlines in SSE data field
+                safe = line.replace("\n", " ")
+                yield f"data: {safe}\n\n"
             if done and not lines:
                 yield "event: done\ndata: \n\n"
                 break
-            if not running and not done:
-                # not started yet, keep waiting
-                pass
-            time.sleep(0.4)
+            # Send keepalive every cycle so connection stays alive during slow phases
+            yield ": ping\n\n"
+            time.sleep(0.5)
     return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 @app.route("/summary")
 def summary():
@@ -231,35 +281,62 @@ PAGE = """<!DOCTYPE html>
   header{
     background:#1a1f2e;border-bottom:2px solid #1F4E79;
     padding:14px 24px;display:flex;align-items:center;justify-content:space-between;
+    position:sticky;top:0;z-index:10;
   }
   header h1{font-size:17px;color:#4fa3e0;font-weight:700;letter-spacing:.03em}
   header .sub{font-size:11px;color:#666;margin-top:2px}
 
   .container{max-width:1300px;margin:0 auto;padding:24px}
 
-  /* Home screen */
+  /* Home */
   .home{
-    display:flex;flex-direction:column;align-items:center;justify-content:center;
-    min-height:70vh;text-align:center;gap:16px;
+    display:flex;flex-direction:column;align-items:center;
+    justify-content:center;min-height:72vh;text-align:center;gap:16px;
   }
   .home h2{font-size:22px;color:#4fa3e0}
-  .home p{color:#666;max-width:480px;line-height:1.6}
-  .home .host-info{
+  .home p{color:#666;max-width:480px;line-height:1.7;font-size:12px}
+  .host-card{
     background:#1a1f2e;border:1px solid #2a3044;border-radius:8px;
-    padding:14px 24px;font-size:12px;color:#aaa;margin-bottom:8px;
+    padding:12px 24px;font-size:12px;color:#aaa;
   }
-  .home .host-info span{color:#4fa3e0;font-weight:700}
+  .host-card span{color:#4fa3e0;font-weight:700}
+
+  /* Progress */
+  .progress-wrap{margin-bottom:20px}
+  .progress-stages{
+    display:flex;justify-content:space-between;
+    margin-bottom:8px;font-size:10px;color:#444;
+    text-transform:uppercase;letter-spacing:.04em;
+  }
+  .progress-stages .ps{
+    flex:1;text-align:center;padding:4px 2px;
+    border-radius:3px;transition:color .3s,background .3s;
+  }
+  .progress-stages .ps.active{color:#4fa3e0;background:#1a2a3a}
+  .progress-stages .ps.complete{color:#4caf50}
+  .progress-bar-bg{
+    background:#1a1f2e;border-radius:20px;height:8px;
+    border:1px solid #2a3044;overflow:hidden;
+  }
+  .progress-bar-fill{
+    height:100%;border-radius:20px;
+    background:linear-gradient(90deg,#1F4E79,#4fa3e0);
+    transition:width .6s ease;width:0%;
+  }
+  .progress-label{
+    text-align:right;font-size:10px;color:#555;margin-top:4px;
+  }
 
   /* Buttons */
   .btn{
     display:inline-flex;align-items:center;gap:6px;
     padding:10px 22px;border-radius:6px;font-size:13px;
     font-weight:700;cursor:pointer;border:none;text-decoration:none;
-    transition:background .15s;
+    transition:background .15s, opacity .15s;
   }
+  .btn:disabled{opacity:.4;cursor:not-allowed}
   .btn-primary{background:#1F4E79;color:#fff}
-  .btn-primary:hover{background:#2a6099}
-  .btn-primary:disabled{background:#1a2a3a;color:#446;cursor:not-allowed}
+  .btn-primary:hover:not(:disabled){background:#2a6099}
   .btn-success{background:#1a3a1a;color:#4caf50;border:1px solid #4caf50}
   .btn-success:hover{background:#1f4a1f}
   .btn-danger{background:#2a1010;color:#e05555;border:1px solid #e05555}
@@ -289,15 +366,16 @@ PAGE = """<!DOCTYPE html>
     padding:8px 14px;border-bottom:1px solid #2a3044;
     display:flex;align-items:center;justify-content:space-between;
   }
-  .log-header span{font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em}
+  .log-header span{font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.04em}
   .log-box{
     padding:12px 14px;font-family:monospace;font-size:11.5px;
-    height:260px;overflow-y:auto;line-height:1.7;
+    height:280px;overflow-y:auto;line-height:1.7;
   }
   .log-box .l{color:#888}
   .log-box .l.ok  {color:#4caf50}
   .log-box .l.warn{color:#ff9800}
   .log-box .l.err {color:#e05555}
+  .log-box .l.stage{color:#4fa3e0;font-weight:700;margin:4px 0}
 
   /* Badge */
   .badge{
@@ -309,22 +387,20 @@ PAGE = """<!DOCTYPE html>
   .b-done   {background:#1a3a1a;color:#4caf50}
   .b-error  {background:#3a1010;color:#e05555}
 
-  /* Section */
   h2{font-size:12px;color:#4fa3e0;text-transform:uppercase;letter-spacing:.05em;
      margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #2a3044}
   .section{margin-bottom:28px}
 
-  /* Table */
   table{width:100%;border-collapse:collapse;font-size:12px}
   th{
     background:#1a1f2e;color:#666;font-size:10px;text-transform:uppercase;
     letter-spacing:.04em;padding:7px 10px;text-align:left;border-bottom:1px solid #2a3044;
+    position:sticky;top:56px;
   }
   td{padding:6px 10px;border-bottom:1px solid #161b27;vertical-align:top}
   tr:hover td{background:#1a1f2e}
   .desc-cell{color:#666;font-size:11px;max-width:280px}
 
-  /* Severity */
   .sev{display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700}
   .sev-Critical  {background:#3a0000;color:#e05555;border:1px solid #e05555}
   .sev-High      {background:#3a1500;color:#e07755;border:1px solid #e07755}
@@ -333,7 +409,6 @@ PAGE = """<!DOCTYPE html>
   .sev-Negligible{background:#1e1e1e;color:#555;border:1px solid #333}
   .sev-Unknown   {background:#1e1e1e;color:#444;border:1px solid #2a2a2a}
 
-  /* Toolbar */
   .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
   input[type=text]{
     background:#1a1f2e;border:1px solid #2a3044;color:#e0e0e0;
@@ -345,7 +420,6 @@ PAGE = """<!DOCTYPE html>
     padding:6px 10px;border-radius:4px;font-size:12px;
   }
 
-  /* Tabs */
   .tabs{display:flex;gap:2px;margin-bottom:20px;border-bottom:1px solid #2a3044}
   .tab{
     padding:8px 16px;font-size:12px;font-weight:700;cursor:pointer;
@@ -357,7 +431,6 @@ PAGE = """<!DOCTYPE html>
   .tab-content{display:none}
   .tab-content.active{display:block}
 
-  /* Modal */
   .overlay{
     display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);
     z-index:100;align-items:center;justify-content:center;
@@ -371,7 +444,6 @@ PAGE = """<!DOCTYPE html>
   .modal p{color:#888;font-size:12px;margin-bottom:20px;line-height:1.6}
   .modal-btns{display:flex;gap:10px;justify-content:center}
 
-  /* Screen toggle */
   #screen-scan{display:none}
 </style>
 </head>
@@ -388,28 +460,41 @@ PAGE = """<!DOCTYPE html>
   </div>
 </header>
 
-<!-- ── Home screen ────────────────────────────────────────────────────────── -->
+<!-- ── Home ─────────────────────────────────────────────────────────────── -->
 <div id="screen-home" class="container">
   <div class="home">
-    <div class="host-info" id="home-hostinfo">Loading host info...</div>
+    <div class="host-card" id="home-hostinfo">Loading...</div>
     <h2>Ready to scan</h2>
-    <p>This tool scans the host filesystem and any Docker images using Syft + Grype,
-       then generates an Excel vulnerability report.</p>
-    <button class="btn btn-primary" id="start-btn" onclick="startScan()" style="font-size:15px;padding:13px 32px">
-      ▶ Start Scan
+    <p>Scans the host filesystem and Docker images using Syft + Grype,
+       then generates a filterable vulnerability report.</p>
+    <button class="btn btn-primary" id="start-btn"
+            onclick="startScan()" style="font-size:15px;padding:14px 36px">
+      ▶&nbsp; Start Scan
     </button>
-    <button class="btn btn-ghost btn-sm" id="results-btn" onclick="showResults()" style="display:none">
+    <button class="btn btn-ghost btn-sm" id="results-btn"
+            onclick="showResults()" style="display:none">
       View last results →
     </button>
   </div>
 </div>
 
-<!-- ── Scan screen ────────────────────────────────────────────────────────── -->
+<!-- ── Scan screen ───────────────────────────────────────────────────────── -->
 <div id="screen-scan" class="container">
 
-  <div class="toolbar" style="margin-bottom:20px">
-    <span style="color:#666;font-size:12px">Scan in progress — results will appear below when complete.</span>
-    <span class="badge b-running" id="scan-badge">Running</span>
+  <!-- Progress -->
+  <div class="progress-wrap section">
+    <div class="progress-stages" id="stage-row">
+      <div class="ps" id="ps-meta">Host Info</div>
+      <div class="ps" id="ps-syft">SBOM</div>
+      <div class="ps" id="ps-grype">Vulns</div>
+      <div class="ps" id="ps-containers">Containers</div>
+      <div class="ps" id="ps-report">Report</div>
+      <div class="ps" id="ps-done">Done</div>
+    </div>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" id="prog-fill"></div>
+    </div>
+    <div class="progress-label" id="prog-label">Starting...</div>
   </div>
 
   <!-- Log -->
@@ -417,16 +502,17 @@ PAGE = """<!DOCTYPE html>
     <div class="log-wrap">
       <div class="log-header">
         <span>Live output</span>
-        <button class="btn btn-ghost btn-sm" onclick="toggleAutoscroll()" id="autoscroll-btn">Autoscroll: ON</button>
+        <button class="btn btn-ghost btn-sm"
+                onclick="toggleAutoscroll()" id="autoscroll-btn">Autoscroll: ON</button>
       </div>
-      <div class="log-box" id="log-box"></div>
+      <div class="log-box" id="log-box">
+        <span style="color:#333">Waiting for output...</span>
+      </div>
     </div>
   </div>
 
-  <!-- Results (shown after scan) -->
+  <!-- Results (shown after done) -->
   <div id="results-panel" style="display:none">
-
-    <!-- Stats -->
     <div class="stats">
       <div class="stat c-grey"><div class="val" id="s-pkgs">—</div><div class="lbl">Host Pkgs</div></div>
       <div class="stat c-blue"><div class="val" id="s-total">—</div><div class="lbl">Total Vulns</div></div>
@@ -436,28 +522,23 @@ PAGE = """<!DOCTYPE html>
       <div class="stat c-low" ><div class="val" id="s-low">—</div><div class="lbl">Low</div></div>
     </div>
 
-    <!-- Actions -->
     <div class="toolbar">
-      <a id="dl-btn" class="btn btn-success" href="/download">⬇ Download Excel Report</a>
+      <a class="btn btn-success" href="/download">⬇ Download Excel Report</a>
       <button class="btn btn-ghost btn-sm" onclick="showHome()">← New scan</button>
     </div>
 
-    <!-- Tabs -->
     <div class="tabs">
       <div class="tab active" onclick="switchTab('vulns')">Vulnerabilities</div>
       <div class="tab" onclick="switchTab('containers')">Containers</div>
     </div>
 
-    <!-- Vuln tab -->
     <div class="tab-content active" id="tab-vulns">
       <div class="toolbar">
         <input type="text" id="filter-input" placeholder="Filter CVE, package, severity...">
         <select id="sev-filter" onchange="applyFilter()">
           <option value="">All severities</option>
-          <option>Critical</option>
-          <option>High</option>
-          <option>Medium</option>
-          <option>Low</option>
+          <option>Critical</option><option>High</option>
+          <option>Medium</option><option>Low</option>
         </select>
         <span id="vuln-count" style="color:#555;font-size:11px"></span>
       </div>
@@ -470,7 +551,6 @@ PAGE = """<!DOCTYPE html>
       </table>
     </div>
 
-    <!-- Container tab -->
     <div class="tab-content" id="tab-containers">
       <table>
         <thead><tr>
@@ -479,15 +559,15 @@ PAGE = """<!DOCTYPE html>
         <tbody id="container-body"></tbody>
       </table>
     </div>
+  </div>
 
-  </div><!-- /results-panel -->
-</div><!-- /screen-scan -->
+</div>
 
 <!-- Shutdown modal -->
 <div class="overlay" id="shutdown-overlay">
   <div class="modal">
     <h3>Shut down the server?</h3>
-    <p>This stops the web UI. Re-run <code>scan-and-report</code> on the host to start it again.</p>
+    <p>This stops the web UI. Re-run <code>scan-and-report</code> to start it again.</p>
     <div class="modal-btns">
       <button class="btn btn-danger" onclick="doShutdown()">Yes, shut down</button>
       <button class="btn btn-ghost" onclick="hideShutdown()">Cancel</button>
@@ -499,19 +579,16 @@ PAGE = """<!DOCTYPE html>
 let allVulns   = [];
 let autoscroll = true;
 let evtSource  = null;
+let logReady   = false;
 
-// ── Startup ──────────────────────────────────────────────────────────────────
+const STAGE_ORDER = ['meta','syft','grype','containers','report','done'];
+
+// ── Init ─────────────────────────────────────────────────────────────────────
 window.onload = () => {
-  // Show host info
-  const hn = location.hostname;
   document.getElementById('home-hostinfo').innerHTML =
-    'Host: <span>' + hn + '</span>';
-
-  // If a previous scan result exists, show the "View last results" button
+    'Host: <span>' + location.hostname + '</span>';
   fetch('/status').then(r => r.json()).then(d => {
-    if (d.done) {
-      document.getElementById('results-btn').style.display = '';
-    }
+    if (d.done) document.getElementById('results-btn').style.display = '';
   });
 };
 
@@ -530,70 +607,132 @@ function showResults() {
 // ── Start scan ───────────────────────────────────────────────────────────────
 function startScan() {
   document.getElementById('start-btn').disabled = true;
+  // Switch screen immediately
   document.getElementById('screen-home').style.display = 'none';
   document.getElementById('screen-scan').style.display = '';
   document.getElementById('results-panel').style.display = 'none';
-  document.getElementById('log-box').innerHTML = '';
-  document.getElementById('status-badge').textContent = 'Scanning';
-  document.getElementById('status-badge').className   = 'badge b-running';
+  document.getElementById('log-box').innerHTML =
+    '<span style="color:#333">Connecting...</span>';
+  logReady = false;
+  setProgress('idle', 0, 'Starting scan...');
+  setBadge('running');
 
   fetch('/start', {method:'POST'})
     .then(r => r.json())
     .then(d => {
       if (d.error) { alert(d.error); showHome(); return; }
       connectStream();
-    });
+    })
+    .catch(e => { alert('Failed to start: ' + e); showHome(); });
 }
 
-// ── SSE log stream ───────────────────────────────────────────────────────────
+// ── SSE ───────────────────────────────────────────────────────────────────────
 function connectStream() {
   if (evtSource) evtSource.close();
   evtSource = new EventSource('/stream');
-  const box = document.getElementById('log-box');
 
   evtSource.onmessage = (e) => {
-    const d = document.createElement('div');
-    d.className = 'l' +
-      (e.data.startsWith('[✓]') ? ' ok'   :
-       e.data.startsWith('[!]') ? ' warn' :
-       e.data.startsWith('[✗]') ? ' err'  : '');
-    d.textContent = e.data;
-    box.appendChild(d);
-    if (autoscroll) box.scrollTop = box.scrollHeight;
+    const line = e.data;
+    if (!line || line.startsWith(': ')) return; // SSE comments/keepalives
+
+    // Stage control messages
+    if (line.startsWith('__STAGE__')) {
+      const parts = line.split('__').filter(Boolean);
+      // parts: ['STAGE', stageName, pct, label]
+      const stage = parts[1];
+      const pct   = parseInt(parts[2]);
+      const label = parts[3];
+      setProgress(stage, pct, label);
+      appendLog('▶ ' + label, 'stage');
+      return;
+    }
+
+    if (!logReady) {
+      document.getElementById('log-box').innerHTML = '';
+      logReady = true;
+    }
+    appendLog(line);
   };
 
   evtSource.addEventListener('done', () => {
     evtSource.close();
     fetch('/status').then(r => r.json()).then(d => {
       if (d.error) {
-        document.getElementById('scan-badge').textContent = 'Error';
-        document.getElementById('scan-badge').className   = 'badge b-error';
-        document.getElementById('status-badge').textContent = 'Error';
-        document.getElementById('status-badge').className   = 'badge b-error';
+        setBadge('error');
+        setProgress('done', 100, 'Finished with errors');
       } else {
-        document.getElementById('scan-badge').textContent = 'Complete';
-        document.getElementById('scan-badge').className   = 'badge b-done';
-        document.getElementById('status-badge').textContent = 'Done';
-        document.getElementById('status-badge').className   = 'badge b-done';
+        setBadge('done');
+        setProgress('done', 100, 'Complete');
         document.getElementById('results-panel').style.display = '';
         loadSummary();
       }
+      document.getElementById('start-btn').disabled = false;
     });
+  });
+
+  evtSource.onerror = () => {
+    // Try to reconnect once after a short delay
+    setTimeout(() => {
+      fetch('/status').then(r => r.json()).then(d => {
+        if (d.running) connectStream();
+      }).catch(() => {});
+    }, 2000);
+  };
+}
+
+function appendLog(text, cls) {
+  const box = document.getElementById('log-box');
+  const d   = document.createElement('div');
+  d.className = 'l' + (cls ? ' ' + cls :
+    text.startsWith('[✓]') ? ' ok'   :
+    text.startsWith('[!]') ? ' warn' :
+    text.startsWith('[✗]') ? ' err'  : '');
+  d.textContent = text;
+  box.appendChild(d);
+  if (autoscroll) box.scrollTop = box.scrollHeight;
+}
+
+// ── Progress ─────────────────────────────────────────────────────────────────
+function setProgress(stage, pct, label) {
+  document.getElementById('prog-fill').style.width  = pct + '%';
+  document.getElementById('prog-label').textContent = label + (pct < 100 ? '...' : '');
+
+  STAGE_ORDER.forEach(s => {
+    const el = document.getElementById('ps-' + s);
+    if (!el) return;
+    const idx     = STAGE_ORDER.indexOf(s);
+    const current = STAGE_ORDER.indexOf(stage);
+    el.classList.remove('active','complete');
+    if (idx < current)       el.classList.add('complete');
+    else if (idx === current) el.classList.add('active');
   });
 }
 
-// ── Autoscroll toggle ────────────────────────────────────────────────────────
+// ── Badge ─────────────────────────────────────────────────────────────────────
+function setBadge(state) {
+  const el  = document.getElementById('status-badge');
+  const map = {
+    idle:    ['b-idle',    'Idle'],
+    running: ['b-running', 'Scanning'],
+    done:    ['b-done',    'Done'],
+    error:   ['b-error',   'Error'],
+  };
+  el.className = 'badge ' + map[state][0];
+  el.textContent = map[state][1];
+}
+
+// ── Autoscroll ────────────────────────────────────────────────────────────────
 function toggleAutoscroll() {
   autoscroll = !autoscroll;
   document.getElementById('autoscroll-btn').textContent =
     'Autoscroll: ' + (autoscroll ? 'ON' : 'OFF');
 }
 
-// ── Load summary ─────────────────────────────────────────────────────────────
+// ── Summary ───────────────────────────────────────────────────────────────────
 function loadSummary() {
   fetch('/summary').then(r => r.json()).then(d => {
     document.getElementById('hdr-host').textContent =
-      (d.meta.hostname || '') + '  ·  ' + (d.meta.os || '');
+      (d.meta.hostname||'') + '  ·  ' + (d.meta.os||'');
     document.getElementById('s-pkgs').textContent  = d.host_pkgs;
     document.getElementById('s-total').textContent = d.counts.total;
     document.getElementById('s-crit').textContent  = d.counts.critical;
@@ -606,12 +745,11 @@ function loadSummary() {
 
     const cb = document.getElementById('container-body');
     cb.innerHTML = d.containers.length ? '' :
-      '<tr><td colspan="5" style="color:#555;font-style:italic">No containers found.</td></tr>';
+      '<tr><td colspan="5" style="color:#555;font-style:italic;padding:10px">No containers found.</td></tr>';
     d.containers.forEach(c => {
       cb.innerHTML += `<tr>
         <td><code>${c.image}</code></td>
-        <td>${c.packages}</td>
-        <td>${c.vulns}</td>
+        <td>${c.packages}</td><td>${c.vulns}</td>
         <td style="color:${c.critical?'#e05555':'#555'}">${c.critical}</td>
         <td style="color:${c.high?'#e07755':'#555'}">${c.high}</td>
       </tr>`;
@@ -619,7 +757,7 @@ function loadSummary() {
   });
 }
 
-// ── Vuln filter ──────────────────────────────────────────────────────────────
+// ── Filter ────────────────────────────────────────────────────────────────────
 function applyFilter() {
   const q   = document.getElementById('filter-input').value.toLowerCase();
   const sev = document.getElementById('sev-filter').value;
@@ -637,8 +775,7 @@ function applyFilter() {
       <td><strong>${v.cve}</strong></td>
       <td><span class="sev sev-${v.severity}">${v.severity}</span></td>
       <td>${v.cvss||'—'}</td>
-      <td>${v.package}</td>
-      <td>${v.version}</td>
+      <td>${v.package}</td><td>${v.version}</td>
       <td>${v.fix||'<span style="color:#444">—</span>'}</td>
       <td style="color:#555;font-size:11px">${v.source}</td>
       <td class="desc-cell">${v.desc}</td>
@@ -647,28 +784,27 @@ function applyFilter() {
   document.getElementById('vuln-count').textContent =
     filtered.length + ' of ' + allVulns.length + ' vulnerabilities';
 }
-
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('filter-input').addEventListener('input', applyFilter);
 });
 
-// ── Tabs ─────────────────────────────────────────────────────────────────────
+// ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => {
-    const ids = ['vulns','containers'];
-    t.classList.toggle('active', ids[i] === name);
-    document.getElementById('tab-'+ids[i]).classList.toggle('active', ids[i] === name);
+  ['vulns','containers'].forEach(id => {
+    document.querySelector(`[onclick="switchTab('${id}')"]`)
+            .classList.toggle('active', id === name);
+    document.getElementById('tab-'+id).classList.toggle('active', id === name);
   });
 }
 
-// ── Shutdown ─────────────────────────────────────────────────────────────────
+// ── Shutdown ──────────────────────────────────────────────────────────────────
 function showShutdown()  { document.getElementById('shutdown-overlay').classList.add('show') }
 function hideShutdown()  { document.getElementById('shutdown-overlay').classList.remove('show') }
 function doShutdown() {
   fetch('/shutdown', {method:'POST'}).finally(() => {
     document.body.innerHTML =
-      '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
-      'font-family:Arial;color:#4caf50;font-size:16px;background:#0f1117">' +
+      '<div style="display:flex;align-items:center;justify-content:center;' +
+      'height:100vh;font-family:Arial;color:#4caf50;font-size:16px;background:#0f1117">' +
       'Server stopped. You can close this tab.</div>';
   });
 }
