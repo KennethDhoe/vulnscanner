@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-webserver.py — Scan status web UI
-- Live log streaming
-- Vuln summary view
-- Excel report download
-- Shutdown button with confirmation
+webserver.py — VulnScanner web UI
+Drive everything from the browser: start scan, watch live logs,
+view results, download report, shut down.
 """
 
 import json
@@ -13,7 +11,6 @@ import glob
 import subprocess
 import threading
 import time
-from pathlib import Path
 from flask import Flask, Response, jsonify, send_file, render_template_string
 
 SCAN_DIR    = os.environ.get("SCAN_DIR",    "/tmp/scan_output")
@@ -24,12 +21,15 @@ PORT        = int(os.environ.get("PORT", 5000))
 app = Flask(__name__)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-scan_log     = []
-scan_done    = False
-scan_started = False
-scan_lock    = threading.Lock()
+state = {
+    "log":     [],
+    "done":    False,
+    "running": False,
+    "error":   False,
+}
+state_lock = threading.Lock()
 
-# ── Data helpers (same logic as generate_report.py) ──────────────────────────
+# ── Data helpers ──────────────────────────────────────────────────────────────
 def load_json(path):
     if not os.path.exists(path):
         return None
@@ -70,15 +70,15 @@ def parse_vulns(vuln_json, source="host"):
     return vulns
 
 def get_summary():
-    meta = load_host_meta()
+    meta      = load_host_meta()
     host_vj   = load_json(os.path.join(SCAN_DIR, "host_vulns.json"))
     host_sbom = load_json(os.path.join(SCAN_DIR, "host_sbom.json"))
-    host_pkgs  = len(host_sbom.get("artifacts", [])) if host_sbom else 0
+    host_pkgs = len(host_sbom.get("artifacts", [])) if host_sbom else 0
     host_vulns = parse_vulns(host_vj, "host")
 
     container_vulns = []
-    containers_dir  = os.path.join(SCAN_DIR, "containers")
     containers      = []
+    containers_dir  = os.path.join(SCAN_DIR, "containers")
     if os.path.isdir(containers_dir):
         for sbom_path in glob.glob(os.path.join(containers_dir, "*_sbom.json")):
             base     = sbom_path.replace("_sbom.json", "")
@@ -96,14 +96,14 @@ def get_summary():
                 "high":     sum(1 for v in vulns if v["severity"] == "High"),
             })
 
-    all_vulns = host_vulns + container_vulns
-    sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Negligible": 4, "Unknown": 5}
+    all_vulns  = host_vulns + container_vulns
+    sev_order  = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Negligible": 4, "Unknown": 5}
 
     return {
-        "meta":        meta,
-        "host_pkgs":   host_pkgs,
-        "containers":  containers,
-        "vulns":       sorted(all_vulns, key=lambda v: (sev_order.get(v["severity"], 99), v["package"])),
+        "meta":       meta,
+        "host_pkgs":  host_pkgs,
+        "containers": containers,
+        "vulns":      sorted(all_vulns, key=lambda v: (sev_order.get(v["severity"], 99), v["package"])),
         "counts": {
             "total":    len(all_vulns),
             "critical": sum(1 for v in all_vulns if v["severity"] == "Critical"),
@@ -113,430 +113,14 @@ def get_summary():
         }
     }
 
-# ── HTML template ─────────────────────────────────────────────────────────────
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VulnScanner</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: Arial, sans-serif; background: #0f1117; color: #e0e0e0; font-size: 13px; }
-
-  header {
-    background: #1a1f2e;
-    border-bottom: 2px solid #1F4E79;
-    padding: 14px 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  header h1 { font-size: 17px; color: #4fa3e0; font-weight: 700; letter-spacing: 0.03em; }
-  header .host { font-size: 11px; color: #888; margin-top: 2px; }
-
-  .container { max-width: 1300px; margin: 0 auto; padding: 20px 24px; }
-
-  /* Stat row */
-  .stats { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-  .stat {
-    flex: 1; min-width: 100px;
-    background: #1a1f2e;
-    border: 1px solid #2a3044;
-    border-radius: 6px;
-    padding: 14px 16px;
-    text-align: center;
-  }
-  .stat .val { font-size: 26px; font-weight: 700; }
-  .stat .lbl { font-size: 10px; color: #888; text-transform: uppercase; margin-top: 3px; }
-  .stat.critical .val { color: #e05555; }
-  .stat.high     .val { color: #e07755; }
-  .stat.medium   .val { color: #e0a855; }
-  .stat.low      .val { color: #e0d455; }
-  .stat.total    .val { color: #4fa3e0; }
-  .stat.pkgs     .val { color: #aaa; }
-
-  /* Log box */
-  .log-box {
-    background: #0d1117;
-    border: 1px solid #2a3044;
-    border-radius: 6px;
-    padding: 14px;
-    font-family: monospace;
-    font-size: 12px;
-    height: 280px;
-    overflow-y: auto;
-    margin-bottom: 20px;
-    line-height: 1.6;
-  }
-  .log-box .line { color: #aaa; }
-  .log-box .line.ok   { color: #4caf50; }
-  .log-box .line.warn { color: #ff9800; }
-  .log-box .line.err  { color: #e05555; }
-
-  /* Status badge */
-  .status-bar {
-    display: flex; align-items: center; gap: 10px;
-    margin-bottom: 12px;
-  }
-  .badge {
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-  }
-  .badge.running  { background: #1a3a5c; color: #4fa3e0; }
-  .badge.done     { background: #1a3a1a; color: #4caf50; }
-  .badge.waiting  { background: #2a2a1a; color: #e0d455; }
-
-  /* Section titles */
-  h2 {
-    font-size: 13px;
-    color: #4fa3e0;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 10px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid #2a3044;
-  }
-
-  /* Tables */
-  .section { margin-bottom: 28px; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th {
-    background: #1a1f2e;
-    color: #888;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    padding: 7px 10px;
-    text-align: left;
-    border-bottom: 1px solid #2a3044;
-  }
-  td {
-    padding: 6px 10px;
-    border-bottom: 1px solid #1a1f2e;
-    vertical-align: top;
-  }
-  tr:hover td { background: #1a1f2e; }
-
-  .sev {
-    display: inline-block;
-    padding: 1px 7px;
-    border-radius: 3px;
-    font-size: 10px;
-    font-weight: 700;
-  }
-  .sev-Critical  { background: #3a0000; color: #e05555; border: 1px solid #e05555; }
-  .sev-High      { background: #3a1500; color: #e07755; border: 1px solid #e07755; }
-  .sev-Medium    { background: #3a2800; color: #e0a855; border: 1px solid #e0a855; }
-  .sev-Low       { background: #3a3500; color: #e0d455; border: 1px solid #e0d455; }
-  .sev-Negligible{ background: #1e1e1e; color: #888;    border: 1px solid #444; }
-  .sev-Unknown   { background: #1e1e1e; color: #666;    border: 1px solid #333; }
-
-  /* Buttons */
-  .btn {
-    display: inline-block;
-    padding: 8px 18px;
-    border-radius: 5px;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-    border: none;
-    text-decoration: none;
-  }
-  .btn-primary  { background: #1F4E79; color: white; }
-  .btn-primary:hover { background: #2a6099; }
-  .btn-danger   { background: #4a1010; color: #e05555; border: 1px solid #e05555; }
-  .btn-danger:hover { background: #6a1515; }
-  .btn-disabled { background: #1e1e1e; color: #444; cursor: not-allowed; }
-
-  .actions { display: flex; gap: 10px; align-items: center; margin-bottom: 24px; }
-
-  .desc-cell { color: #888; font-size: 11px; max-width: 300px; }
-
-  /* Shutdown modal */
-  .modal-overlay {
-    display: none;
-    position: fixed; inset: 0;
-    background: rgba(0,0,0,0.7);
-    z-index: 100;
-    align-items: center;
-    justify-content: center;
-  }
-  .modal-overlay.active { display: flex; }
-  .modal {
-    background: #1a1f2e;
-    border: 1px solid #2a3044;
-    border-radius: 8px;
-    padding: 28px 32px;
-    max-width: 380px;
-    text-align: center;
-  }
-  .modal h3 { color: #e05555; margin-bottom: 10px; font-size: 15px; }
-  .modal p  { color: #aaa; font-size: 12px; margin-bottom: 20px; }
-  .modal .btn-row { display: flex; gap: 10px; justify-content: center; }
-
-  #filter-input {
-    background: #1a1f2e;
-    border: 1px solid #2a3044;
-    color: #e0e0e0;
-    padding: 6px 12px;
-    border-radius: 4px;
-    font-size: 12px;
-    width: 220px;
-    margin-bottom: 10px;
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div>
-    <h1>🔍 VulnScanner</h1>
-    <div class="host" id="host-label">Loading...</div>
-  </div>
-  <button class="btn btn-danger" onclick="document.getElementById('shutdown-modal').classList.add('active')">
-    Stop &amp; Shutdown
-  </button>
-</header>
-
-<div class="container">
-
-  <!-- Stats -->
-  <div class="stats" id="stats-row">
-    <div class="stat pkgs">    <div class="val" id="s-pkgs">—</div>    <div class="lbl">Host Packages</div></div>
-    <div class="stat total">   <div class="val" id="s-total">—</div>   <div class="lbl">Total Vulns</div></div>
-    <div class="stat critical"><div class="val" id="s-crit">—</div>    <div class="lbl">Critical</div></div>
-    <div class="stat high">    <div class="val" id="s-high">—</div>    <div class="lbl">High</div></div>
-    <div class="stat medium">  <div class="val" id="s-med">—</div>     <div class="lbl">Medium</div></div>
-    <div class="stat low">     <div class="val" id="s-low">—</div>     <div class="lbl">Low</div></div>
-  </div>
-
-  <!-- Actions -->
-  <div class="actions">
-    <a id="dl-btn" class="btn btn-disabled" href="#">⬇ Download Excel Report</a>
-    <span id="scan-status-badge" class="badge waiting">Waiting</span>
-  </div>
-
-  <!-- Log -->
-  <div class="section">
-    <h2>Scan Log</h2>
-    <div class="log-box" id="log-box"><span style="color:#555">Waiting for scan output...</span></div>
-  </div>
-
-  <!-- Vuln table -->
-  <div class="section" id="vuln-section" style="display:none">
-    <h2>Vulnerabilities</h2>
-    <input id="filter-input" type="text" placeholder="Filter by CVE, package, severity...">
-    <table id="vuln-table">
-      <thead><tr>
-        <th>CVE / ID</th><th>Severity</th><th>CVSS</th>
-        <th>Package</th><th>Version</th><th>Fix</th><th>Source</th><th>Description</th>
-      </tr></thead>
-      <tbody id="vuln-body"></tbody>
-    </table>
-  </div>
-
-  <!-- Container table -->
-  <div class="section" id="container-section" style="display:none">
-    <h2>Containers</h2>
-    <table>
-      <thead><tr>
-        <th>Image</th><th>Packages</th><th>Vulns</th><th>Critical</th><th>High</th>
-      </tr></thead>
-      <tbody id="container-body"></tbody>
-    </table>
-  </div>
-
-</div>
-
-<!-- Shutdown modal -->
-<div class="modal-overlay" id="shutdown-modal">
-  <div class="modal">
-    <h3>Shut down the server?</h3>
-    <p>This will stop the web UI. You can re-run <code>scan-and-report</code> at any time.</p>
-    <div class="btn-row">
-      <button class="btn btn-danger" onclick="shutdown()">Yes, shut down</button>
-      <button class="btn btn-primary" onclick="document.getElementById('shutdown-modal').classList.remove('active')">Cancel</button>
-    </div>
-  </div>
-</div>
-
-<script>
-  let allVulns = [];
-
-  // ── Log streaming ──────────────────────────────────────────────────────────
-  const logBox = document.getElementById('log-box');
-  let logEmpty = true;
-
-  const evtSource = new EventSource('/stream');
-  evtSource.onmessage = (e) => {
-    if (logEmpty) { logBox.innerHTML = ''; logEmpty = false; }
-    const line = document.createElement('div');
-    line.className = 'line' +
-      (e.data.startsWith('[✓]') ? ' ok' :
-       e.data.startsWith('[!]') ? ' warn' :
-       e.data.startsWith('[✗]') ? ' err' : '');
-    line.textContent = e.data;
-    logBox.appendChild(line);
-    logBox.scrollTop = logBox.scrollHeight;
-  };
-
-  evtSource.addEventListener('done', () => {
-    evtSource.close();
-    document.getElementById('scan-status-badge').textContent = 'Complete';
-    document.getElementById('scan-status-badge').className = 'badge done';
-    loadSummary();
-    const dlBtn = document.getElementById('dl-btn');
-    dlBtn.href = '/download';
-    dlBtn.className = 'btn btn-primary';
-  });
-
-  evtSource.addEventListener('running', () => {
-    document.getElementById('scan-status-badge').textContent = 'Scanning';
-    document.getElementById('scan-status-badge').className = 'badge running';
-  });
-
-  // ── Summary ────────────────────────────────────────────────────────────────
-  function loadSummary() {
-    fetch('/summary')
-      .then(r => r.json())
-      .then(d => {
-        document.getElementById('host-label').textContent =
-          (d.meta.hostname || '') + '  ·  ' + (d.meta.os || '') + '  ·  ' + (d.meta.date || '');
-        document.getElementById('s-pkgs').textContent  = d.host_pkgs;
-        document.getElementById('s-total').textContent = d.counts.total;
-        document.getElementById('s-crit').textContent  = d.counts.critical;
-        document.getElementById('s-high').textContent  = d.counts.high;
-        document.getElementById('s-med').textContent   = d.counts.medium;
-        document.getElementById('s-low').textContent   = d.counts.low;
-
-        // Vulns table
-        allVulns = d.vulns;
-        renderVulns(allVulns);
-        document.getElementById('vuln-section').style.display = allVulns.length ? '' : 'none';
-
-        // Containers
-        const cb = document.getElementById('container-body');
-        cb.innerHTML = '';
-        d.containers.forEach(c => {
-          cb.innerHTML += `<tr>
-            <td><code>${c.image}</code></td>
-            <td>${c.packages}</td>
-            <td>${c.vulns}</td>
-            <td style="color:${c.critical ? '#e05555' : '#aaa'}">${c.critical}</td>
-            <td style="color:${c.high ? '#e07755' : '#aaa'}">${c.high}</td>
-          </tr>`;
-        });
-        if (d.containers.length) document.getElementById('container-section').style.display = '';
-      });
-  }
-
-  function renderVulns(vulns) {
-    const tb = document.getElementById('vuln-body');
-    tb.innerHTML = '';
-    vulns.forEach(v => {
-      tb.innerHTML += `<tr>
-        <td><strong>${v.cve}</strong></td>
-        <td><span class="sev sev-${v.severity}">${v.severity}</span></td>
-        <td>${v.cvss || '—'}</td>
-        <td>${v.package}</td>
-        <td>${v.version}</td>
-        <td>${v.fix || '<span style="color:#555">—</span>'}</td>
-        <td><span style="color:#666;font-size:11px">${v.source}</span></td>
-        <td class="desc-cell">${v.desc}</td>
-      </tr>`;
-    });
-  }
-
-  // ── Filter ─────────────────────────────────────────────────────────────────
-  document.getElementById('filter-input').addEventListener('input', function() {
-    const q = this.value.toLowerCase();
-    renderVulns(allVulns.filter(v =>
-      v.cve.toLowerCase().includes(q) ||
-      v.package.toLowerCase().includes(q) ||
-      v.severity.toLowerCase().includes(q) ||
-      v.source.toLowerCase().includes(q)
-    ));
-  });
-
-  // ── Shutdown ───────────────────────────────────────────────────────────────
-  function shutdown() {
-    fetch('/shutdown', { method: 'POST' }).finally(() => {
-      document.getElementById('shutdown-modal').classList.remove('active');
-      document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:Arial;color:#4caf50;font-size:18px">Server stopped. You can close this tab.</div>';
-    });
-  }
-
-  // Poll summary every 5s while scan is running (in case SSE missed done event)
-  setInterval(() => {
-    fetch('/status').then(r => r.json()).then(d => {
-      if (d.done) loadSummary();
-    });
-  }, 5000);
-</script>
-</body>
-</html>"""
-
-# ── Routes ────────────────────────────────────────────────────────────────────
-@app.route("/")
-def index():
-    return render_template_string(PAGE)
-
-@app.route("/stream")
-def stream():
-    def generate():
-        yield "event: running\ndata: scan started\n\n"
-        last = 0
-        while True:
-            with scan_lock:
-                lines = scan_log[last:]
-                last += len(lines)
-                done = scan_done
-            for line in lines:
-                yield f"data: {line}\n\n"
-            if done and not lines:
-                yield "event: done\ndata: complete\n\n"
-                break
-            time.sleep(0.5)
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-@app.route("/summary")
-def summary():
-    return jsonify(get_summary())
-
-@app.route("/status")
-def status():
-    return jsonify({"done": scan_done})
-
-@app.route("/download")
-def download():
-    if not os.path.exists(REPORT_PATH):
-        return "Report not ready yet", 404
-    return send_file(REPORT_PATH, as_attachment=True,
-                     download_name=os.path.basename(REPORT_PATH))
-
-@app.route("/shutdown", methods=["POST"])
-def shutdown_server():
-    def _stop():
-        time.sleep(1)
-        os._exit(0)
-    threading.Thread(target=_stop, daemon=True).start()
-    return "Shutting down"
-
 # ── Scan runner ───────────────────────────────────────────────────────────────
 def run_scan():
-    global scan_done
     venv_python = os.path.join(INSTALL_DIR, "venv", "bin", "python3")
+    os.makedirs(SCAN_DIR, exist_ok=True)
 
     commands = [
         ["bash", os.path.join(INSTALL_DIR, "scan.sh"), SCAN_DIR],
-        [venv_python, os.path.join(INSTALL_DIR, "generate_report.py"),
-         SCAN_DIR, REPORT_PATH],
+        [venv_python, os.path.join(INSTALL_DIR, "generate_report.py"), SCAN_DIR, REPORT_PATH],
     ]
 
     for cmd in commands:
@@ -550,20 +134,560 @@ def run_scan():
         for line in proc.stdout:
             line = line.rstrip()
             if line:
-                with scan_lock:
-                    scan_log.append(line)
+                with state_lock:
+                    state["log"].append(line)
         proc.wait()
         if proc.returncode != 0:
-            with scan_lock:
-                scan_log.append(f"[✗] Command failed with exit code {proc.returncode}")
+            with state_lock:
+                state["log"].append(f"[✗] Command failed with exit code {proc.returncode}")
+                state["error"] = True
 
-    with scan_lock:
-        scan_done = True
-        scan_log.append("[✓] All done. Download your report above.")
+    with state_lock:
+        state["done"]    = True
+        state["running"] = False
+        if not state["error"]:
+            state["log"].append("[✓] Scan complete. Report is ready for download.")
+        else:
+            state["log"].append("[✗] Scan finished with errors. Check the log above.")
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(PAGE)
+
+@app.route("/start", methods=["POST"])
+def start_scan():
+    with state_lock:
+        if state["running"]:
+            return jsonify({"error": "Scan already running"}), 409
+        state["log"]     = []
+        state["done"]    = False
+        state["running"] = True
+        state["error"]   = False
+    threading.Thread(target=run_scan, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/status")
+def status():
+    with state_lock:
+        return jsonify({
+            "running": state["running"],
+            "done":    state["done"],
+            "error":   state["error"],
+        })
+
+@app.route("/stream")
+def stream():
+    def generate():
+        sent = 0
+        while True:
+            with state_lock:
+                lines   = state["log"][sent:]
+                sent   += len(lines)
+                done    = state["done"]
+                running = state["running"]
+            for line in lines:
+                yield f"data: {line}\n\n"
+            if done and not lines:
+                yield "event: done\ndata: \n\n"
+                break
+            if not running and not done:
+                # not started yet, keep waiting
+                pass
+            time.sleep(0.4)
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.route("/summary")
+def summary():
+    return jsonify(get_summary())
+
+@app.route("/download")
+def download():
+    if not os.path.exists(REPORT_PATH):
+        return "Report not ready", 404
+    return send_file(REPORT_PATH, as_attachment=True,
+                     download_name=os.path.basename(REPORT_PATH))
+
+@app.route("/shutdown", methods=["POST"])
+def shutdown_server():
+    def _stop():
+        time.sleep(1)
+        os._exit(0)
+    threading.Thread(target=_stop, daemon=True).start()
+    return "ok"
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VulnScanner</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:Arial,sans-serif;background:#0f1117;color:#e0e0e0;font-size:13px}
+
+  header{
+    background:#1a1f2e;border-bottom:2px solid #1F4E79;
+    padding:14px 24px;display:flex;align-items:center;justify-content:space-between;
+  }
+  header h1{font-size:17px;color:#4fa3e0;font-weight:700;letter-spacing:.03em}
+  header .sub{font-size:11px;color:#666;margin-top:2px}
+
+  .container{max-width:1300px;margin:0 auto;padding:24px}
+
+  /* Home screen */
+  .home{
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    min-height:70vh;text-align:center;gap:16px;
+  }
+  .home h2{font-size:22px;color:#4fa3e0}
+  .home p{color:#666;max-width:480px;line-height:1.6}
+  .home .host-info{
+    background:#1a1f2e;border:1px solid #2a3044;border-radius:8px;
+    padding:14px 24px;font-size:12px;color:#aaa;margin-bottom:8px;
+  }
+  .home .host-info span{color:#4fa3e0;font-weight:700}
+
+  /* Buttons */
+  .btn{
+    display:inline-flex;align-items:center;gap:6px;
+    padding:10px 22px;border-radius:6px;font-size:13px;
+    font-weight:700;cursor:pointer;border:none;text-decoration:none;
+    transition:background .15s;
+  }
+  .btn-primary{background:#1F4E79;color:#fff}
+  .btn-primary:hover{background:#2a6099}
+  .btn-primary:disabled{background:#1a2a3a;color:#446;cursor:not-allowed}
+  .btn-success{background:#1a3a1a;color:#4caf50;border:1px solid #4caf50}
+  .btn-success:hover{background:#1f4a1f}
+  .btn-danger{background:#2a1010;color:#e05555;border:1px solid #e05555}
+  .btn-danger:hover{background:#3a1515}
+  .btn-ghost{background:transparent;color:#666;border:1px solid #2a3044}
+  .btn-ghost:hover{background:#1a1f2e;color:#aaa}
+  .btn-sm{padding:5px 12px;font-size:11px}
+
+  /* Stats */
+  .stats{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
+  .stat{
+    flex:1;min-width:90px;background:#1a1f2e;
+    border:1px solid #2a3044;border-radius:6px;padding:12px 14px;text-align:center;
+  }
+  .stat .val{font-size:24px;font-weight:700}
+  .stat .lbl{font-size:10px;color:#666;text-transform:uppercase;margin-top:2px}
+  .stat.c-crit .val{color:#e05555}
+  .stat.c-high .val{color:#e07755}
+  .stat.c-med  .val{color:#e0a855}
+  .stat.c-low  .val{color:#e0d455}
+  .stat.c-blue .val{color:#4fa3e0}
+  .stat.c-grey .val{color:#aaa}
+
+  /* Log */
+  .log-wrap{background:#0d1117;border:1px solid #2a3044;border-radius:6px;margin-bottom:20px}
+  .log-header{
+    padding:8px 14px;border-bottom:1px solid #2a3044;
+    display:flex;align-items:center;justify-content:space-between;
+  }
+  .log-header span{font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.04em}
+  .log-box{
+    padding:12px 14px;font-family:monospace;font-size:11.5px;
+    height:260px;overflow-y:auto;line-height:1.7;
+  }
+  .log-box .l{color:#888}
+  .log-box .l.ok  {color:#4caf50}
+  .log-box .l.warn{color:#ff9800}
+  .log-box .l.err {color:#e05555}
+
+  /* Badge */
+  .badge{
+    display:inline-block;padding:2px 9px;border-radius:20px;
+    font-size:10px;font-weight:700;text-transform:uppercase;
+  }
+  .b-idle   {background:#1e1e1e;color:#555}
+  .b-running{background:#1a3a5c;color:#4fa3e0}
+  .b-done   {background:#1a3a1a;color:#4caf50}
+  .b-error  {background:#3a1010;color:#e05555}
+
+  /* Section */
+  h2{font-size:12px;color:#4fa3e0;text-transform:uppercase;letter-spacing:.05em;
+     margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #2a3044}
+  .section{margin-bottom:28px}
+
+  /* Table */
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th{
+    background:#1a1f2e;color:#666;font-size:10px;text-transform:uppercase;
+    letter-spacing:.04em;padding:7px 10px;text-align:left;border-bottom:1px solid #2a3044;
+  }
+  td{padding:6px 10px;border-bottom:1px solid #161b27;vertical-align:top}
+  tr:hover td{background:#1a1f2e}
+  .desc-cell{color:#666;font-size:11px;max-width:280px}
+
+  /* Severity */
+  .sev{display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700}
+  .sev-Critical  {background:#3a0000;color:#e05555;border:1px solid #e05555}
+  .sev-High      {background:#3a1500;color:#e07755;border:1px solid #e07755}
+  .sev-Medium    {background:#3a2800;color:#e0a855;border:1px solid #e0a855}
+  .sev-Low       {background:#3a3500;color:#e0d455;border:1px solid #e0d455}
+  .sev-Negligible{background:#1e1e1e;color:#555;border:1px solid #333}
+  .sev-Unknown   {background:#1e1e1e;color:#444;border:1px solid #2a2a2a}
+
+  /* Toolbar */
+  .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+  input[type=text]{
+    background:#1a1f2e;border:1px solid #2a3044;color:#e0e0e0;
+    padding:6px 12px;border-radius:4px;font-size:12px;width:240px;
+  }
+  input[type=text]::placeholder{color:#444}
+  select{
+    background:#1a1f2e;border:1px solid #2a3044;color:#aaa;
+    padding:6px 10px;border-radius:4px;font-size:12px;
+  }
+
+  /* Tabs */
+  .tabs{display:flex;gap:2px;margin-bottom:20px;border-bottom:1px solid #2a3044}
+  .tab{
+    padding:8px 16px;font-size:12px;font-weight:700;cursor:pointer;
+    color:#666;border-bottom:2px solid transparent;margin-bottom:-1px;
+    text-transform:uppercase;letter-spacing:.04em;
+  }
+  .tab:hover{color:#aaa}
+  .tab.active{color:#4fa3e0;border-bottom-color:#4fa3e0}
+  .tab-content{display:none}
+  .tab-content.active{display:block}
+
+  /* Modal */
+  .overlay{
+    display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);
+    z-index:100;align-items:center;justify-content:center;
+  }
+  .overlay.show{display:flex}
+  .modal{
+    background:#1a1f2e;border:1px solid #2a3044;border-radius:8px;
+    padding:28px 32px;max-width:380px;text-align:center;
+  }
+  .modal h3{color:#e05555;margin-bottom:8px;font-size:15px}
+  .modal p{color:#888;font-size:12px;margin-bottom:20px;line-height:1.6}
+  .modal-btns{display:flex;gap:10px;justify-content:center}
+
+  /* Screen toggle */
+  #screen-scan{display:none}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>🔍 VulnScanner</h1>
+    <div class="sub" id="hdr-host">Ready</div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span class="badge b-idle" id="status-badge">Idle</span>
+    <button class="btn btn-danger btn-sm" onclick="showShutdown()">Shut down</button>
+  </div>
+</header>
+
+<!-- ── Home screen ────────────────────────────────────────────────────────── -->
+<div id="screen-home" class="container">
+  <div class="home">
+    <div class="host-info" id="home-hostinfo">Loading host info...</div>
+    <h2>Ready to scan</h2>
+    <p>This tool scans the host filesystem and any Docker images using Syft + Grype,
+       then generates an Excel vulnerability report.</p>
+    <button class="btn btn-primary" id="start-btn" onclick="startScan()" style="font-size:15px;padding:13px 32px">
+      ▶ Start Scan
+    </button>
+    <button class="btn btn-ghost btn-sm" id="results-btn" onclick="showResults()" style="display:none">
+      View last results →
+    </button>
+  </div>
+</div>
+
+<!-- ── Scan screen ────────────────────────────────────────────────────────── -->
+<div id="screen-scan" class="container">
+
+  <div class="toolbar" style="margin-bottom:20px">
+    <span style="color:#666;font-size:12px">Scan in progress — results will appear below when complete.</span>
+    <span class="badge b-running" id="scan-badge">Running</span>
+  </div>
+
+  <!-- Log -->
+  <div class="section">
+    <div class="log-wrap">
+      <div class="log-header">
+        <span>Live output</span>
+        <button class="btn btn-ghost btn-sm" onclick="toggleAutoscroll()" id="autoscroll-btn">Autoscroll: ON</button>
+      </div>
+      <div class="log-box" id="log-box"></div>
+    </div>
+  </div>
+
+  <!-- Results (shown after scan) -->
+  <div id="results-panel" style="display:none">
+
+    <!-- Stats -->
+    <div class="stats">
+      <div class="stat c-grey"><div class="val" id="s-pkgs">—</div><div class="lbl">Host Pkgs</div></div>
+      <div class="stat c-blue"><div class="val" id="s-total">—</div><div class="lbl">Total Vulns</div></div>
+      <div class="stat c-crit"><div class="val" id="s-crit">—</div><div class="lbl">Critical</div></div>
+      <div class="stat c-high"><div class="val" id="s-high">—</div><div class="lbl">High</div></div>
+      <div class="stat c-med" ><div class="val" id="s-med">—</div><div class="lbl">Medium</div></div>
+      <div class="stat c-low" ><div class="val" id="s-low">—</div><div class="lbl">Low</div></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="toolbar">
+      <a id="dl-btn" class="btn btn-success" href="/download">⬇ Download Excel Report</a>
+      <button class="btn btn-ghost btn-sm" onclick="showHome()">← New scan</button>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('vulns')">Vulnerabilities</div>
+      <div class="tab" onclick="switchTab('containers')">Containers</div>
+    </div>
+
+    <!-- Vuln tab -->
+    <div class="tab-content active" id="tab-vulns">
+      <div class="toolbar">
+        <input type="text" id="filter-input" placeholder="Filter CVE, package, severity...">
+        <select id="sev-filter" onchange="applyFilter()">
+          <option value="">All severities</option>
+          <option>Critical</option>
+          <option>High</option>
+          <option>Medium</option>
+          <option>Low</option>
+        </select>
+        <span id="vuln-count" style="color:#555;font-size:11px"></span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>CVE / ID</th><th>Severity</th><th>CVSS</th>
+          <th>Package</th><th>Version</th><th>Fix</th><th>Source</th><th>Description</th>
+        </tr></thead>
+        <tbody id="vuln-body"></tbody>
+      </table>
+    </div>
+
+    <!-- Container tab -->
+    <div class="tab-content" id="tab-containers">
+      <table>
+        <thead><tr>
+          <th>Image</th><th>Packages</th><th>Vulns</th><th>Critical</th><th>High</th>
+        </tr></thead>
+        <tbody id="container-body"></tbody>
+      </table>
+    </div>
+
+  </div><!-- /results-panel -->
+</div><!-- /screen-scan -->
+
+<!-- Shutdown modal -->
+<div class="overlay" id="shutdown-overlay">
+  <div class="modal">
+    <h3>Shut down the server?</h3>
+    <p>This stops the web UI. Re-run <code>scan-and-report</code> on the host to start it again.</p>
+    <div class="modal-btns">
+      <button class="btn btn-danger" onclick="doShutdown()">Yes, shut down</button>
+      <button class="btn btn-ghost" onclick="hideShutdown()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let allVulns   = [];
+let autoscroll = true;
+let evtSource  = null;
+
+// ── Startup ──────────────────────────────────────────────────────────────────
+window.onload = () => {
+  // Show host info
+  const hn = location.hostname;
+  document.getElementById('home-hostinfo').innerHTML =
+    'Host: <span>' + hn + '</span>';
+
+  // If a previous scan result exists, show the "View last results" button
+  fetch('/status').then(r => r.json()).then(d => {
+    if (d.done) {
+      document.getElementById('results-btn').style.display = '';
+    }
+  });
+};
+
+// ── Screen switching ─────────────────────────────────────────────────────────
+function showHome() {
+  document.getElementById('screen-home').style.display = '';
+  document.getElementById('screen-scan').style.display = 'none';
+}
+function showResults() {
+  document.getElementById('screen-home').style.display = 'none';
+  document.getElementById('screen-scan').style.display = '';
+  document.getElementById('results-panel').style.display = '';
+  loadSummary();
+}
+
+// ── Start scan ───────────────────────────────────────────────────────────────
+function startScan() {
+  document.getElementById('start-btn').disabled = true;
+  document.getElementById('screen-home').style.display = 'none';
+  document.getElementById('screen-scan').style.display = '';
+  document.getElementById('results-panel').style.display = 'none';
+  document.getElementById('log-box').innerHTML = '';
+  document.getElementById('status-badge').textContent = 'Scanning';
+  document.getElementById('status-badge').className   = 'badge b-running';
+
+  fetch('/start', {method:'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { alert(d.error); showHome(); return; }
+      connectStream();
+    });
+}
+
+// ── SSE log stream ───────────────────────────────────────────────────────────
+function connectStream() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource('/stream');
+  const box = document.getElementById('log-box');
+
+  evtSource.onmessage = (e) => {
+    const d = document.createElement('div');
+    d.className = 'l' +
+      (e.data.startsWith('[✓]') ? ' ok'   :
+       e.data.startsWith('[!]') ? ' warn' :
+       e.data.startsWith('[✗]') ? ' err'  : '');
+    d.textContent = e.data;
+    box.appendChild(d);
+    if (autoscroll) box.scrollTop = box.scrollHeight;
+  };
+
+  evtSource.addEventListener('done', () => {
+    evtSource.close();
+    fetch('/status').then(r => r.json()).then(d => {
+      if (d.error) {
+        document.getElementById('scan-badge').textContent = 'Error';
+        document.getElementById('scan-badge').className   = 'badge b-error';
+        document.getElementById('status-badge').textContent = 'Error';
+        document.getElementById('status-badge').className   = 'badge b-error';
+      } else {
+        document.getElementById('scan-badge').textContent = 'Complete';
+        document.getElementById('scan-badge').className   = 'badge b-done';
+        document.getElementById('status-badge').textContent = 'Done';
+        document.getElementById('status-badge').className   = 'badge b-done';
+        document.getElementById('results-panel').style.display = '';
+        loadSummary();
+      }
+    });
+  });
+}
+
+// ── Autoscroll toggle ────────────────────────────────────────────────────────
+function toggleAutoscroll() {
+  autoscroll = !autoscroll;
+  document.getElementById('autoscroll-btn').textContent =
+    'Autoscroll: ' + (autoscroll ? 'ON' : 'OFF');
+}
+
+// ── Load summary ─────────────────────────────────────────────────────────────
+function loadSummary() {
+  fetch('/summary').then(r => r.json()).then(d => {
+    document.getElementById('hdr-host').textContent =
+      (d.meta.hostname || '') + '  ·  ' + (d.meta.os || '');
+    document.getElementById('s-pkgs').textContent  = d.host_pkgs;
+    document.getElementById('s-total').textContent = d.counts.total;
+    document.getElementById('s-crit').textContent  = d.counts.critical;
+    document.getElementById('s-high').textContent  = d.counts.high;
+    document.getElementById('s-med').textContent   = d.counts.medium;
+    document.getElementById('s-low').textContent   = d.counts.low;
+
+    allVulns = d.vulns;
+    applyFilter();
+
+    const cb = document.getElementById('container-body');
+    cb.innerHTML = d.containers.length ? '' :
+      '<tr><td colspan="5" style="color:#555;font-style:italic">No containers found.</td></tr>';
+    d.containers.forEach(c => {
+      cb.innerHTML += `<tr>
+        <td><code>${c.image}</code></td>
+        <td>${c.packages}</td>
+        <td>${c.vulns}</td>
+        <td style="color:${c.critical?'#e05555':'#555'}">${c.critical}</td>
+        <td style="color:${c.high?'#e07755':'#555'}">${c.high}</td>
+      </tr>`;
+    });
+  });
+}
+
+// ── Vuln filter ──────────────────────────────────────────────────────────────
+function applyFilter() {
+  const q   = document.getElementById('filter-input').value.toLowerCase();
+  const sev = document.getElementById('sev-filter').value;
+  const filtered = allVulns.filter(v =>
+    (!sev || v.severity === sev) &&
+    (!q   || v.cve.toLowerCase().includes(q) ||
+             v.package.toLowerCase().includes(q) ||
+             v.severity.toLowerCase().includes(q) ||
+             v.source.toLowerCase().includes(q))
+  );
+  const tb = document.getElementById('vuln-body');
+  tb.innerHTML = '';
+  filtered.forEach(v => {
+    tb.innerHTML += `<tr>
+      <td><strong>${v.cve}</strong></td>
+      <td><span class="sev sev-${v.severity}">${v.severity}</span></td>
+      <td>${v.cvss||'—'}</td>
+      <td>${v.package}</td>
+      <td>${v.version}</td>
+      <td>${v.fix||'<span style="color:#444">—</span>'}</td>
+      <td style="color:#555;font-size:11px">${v.source}</td>
+      <td class="desc-cell">${v.desc}</td>
+    </tr>`;
+  });
+  document.getElementById('vuln-count').textContent =
+    filtered.length + ' of ' + allVulns.length + ' vulnerabilities';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('filter-input').addEventListener('input', applyFilter);
+});
+
+// ── Tabs ─────────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    const ids = ['vulns','containers'];
+    t.classList.toggle('active', ids[i] === name);
+    document.getElementById('tab-'+ids[i]).classList.toggle('active', ids[i] === name);
+  });
+}
+
+// ── Shutdown ─────────────────────────────────────────────────────────────────
+function showShutdown()  { document.getElementById('shutdown-overlay').classList.add('show') }
+function hideShutdown()  { document.getElementById('shutdown-overlay').classList.remove('show') }
+function doShutdown() {
+  fetch('/shutdown', {method:'POST'}).finally(() => {
+    document.body.innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
+      'font-family:Arial;color:#4caf50;font-size:16px;background:#0f1117">' +
+      'Server stopped. You can close this tab.</div>';
+  });
+}
+</script>
+</body>
+</html>"""
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_scan, daemon=True)
-    t.start()
-    print(f"[*] Web UI running at http://0.0.0.0:{PORT}")
-    print(f"[*] Open http://$(hostname -I | awk '{{print $1}}'):{PORT} from your browser")
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip = "localhost"
+
+    print(f"\n{'='*48}")
+    print(f"  VulnScanner ready")
+    print(f"  Open: http://{ip}:{PORT}")
+    print(f"{'='*48}\n")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
