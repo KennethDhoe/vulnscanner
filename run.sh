@@ -33,9 +33,14 @@ NEED_GRYPE=false
 NEED_VENV=false
 NEED_SCRIPTS=false
 
-# System deps: check for the key ones (python3 + venv)
-if ! command -v python3 &>/dev/null || ! python3 -m venv --help &>/dev/null 2>&1; then
+# System deps: check for python3 AND that venv actually works
+if ! command -v python3 &>/dev/null; then
   NEED_SYSDEPS=true
+elif ! python3 -m venv /tmp/vulnscanner_venv_test &>/dev/null 2>&1; then
+  NEED_SYSDEPS=true
+  rm -rf /tmp/vulnscanner_venv_test
+else
+  rm -rf /tmp/vulnscanner_venv_test
 fi
 
 command -v syft  &>/dev/null  || NEED_SYFT=true
