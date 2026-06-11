@@ -22,7 +22,18 @@ echo "[*] Collecting host metadata..."
 
 # ── Host SBOM (Syft) ─────────────────────────────────────────────────────────
 echo "[*] Scanning host filesystem with Syft..."
-syft scan dir:/var/lib/dpkg dir:/var/lib/rpm dir:/lib/apk \
+# Detect which package DB exists and scan only that
+if [ -d /var/lib/dpkg ]; then
+  SYFT_SOURCE="dir:/var/lib/dpkg"
+elif [ -d /var/lib/rpm ]; then
+  SYFT_SOURCE="dir:/var/lib/rpm"
+elif [ -d /lib/apk ]; then
+  SYFT_SOURCE="dir:/lib/apk"
+else
+  SYFT_SOURCE="dir:/"
+fi
+
+syft scan "$SYFT_SOURCE" \
   -o syft-json \
   > "$OUTPUT_DIR/host_sbom.json"
 
