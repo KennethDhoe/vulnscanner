@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — Bootstrap Syft + Grype + Python env for security scanning
 # Supports: Debian/Ubuntu, RHEL/CentOS/Fedora, Alpine, Arch, SUSE
-# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/YOURUSER/YOURREPO/main/install.sh)
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/KennethDhoe/vulnscanner/main/install.sh)
 
 set -euo pipefail
 
@@ -13,12 +13,12 @@ detect_distro() {
   if [ -f /etc/os-release ]; then
     . /etc/os-release
     echo "${ID_LIKE:-$ID}"
-  elif command -v apk &>/dev/null;    then echo "alpine"
+  elif command -v apk &>/dev/null;     then echo "alpine"
   elif command -v apt-get &>/dev/null; then echo "debian"
-  elif command -v dnf &>/dev/null;    then echo "fedora"
-  elif command -v yum &>/dev/null;    then echo "rhel"
-  elif command -v pacman &>/dev/null; then echo "arch"
-  elif command -v zypper &>/dev/null; then echo "suse"
+  elif command -v dnf &>/dev/null;     then echo "fedora"
+  elif command -v yum &>/dev/null;     then echo "rhel"
+  elif command -v pacman &>/dev/null;  then echo "arch"
+  elif command -v zypper &>/dev/null;  then echo "suse"
   else echo "unknown"
   fi
 }
@@ -26,7 +26,7 @@ detect_distro() {
 DISTRO=$(detect_distro)
 echo "[*] Detected distro family: $DISTRO"
 
-# ── List packages (shown to user before install) ──────────────────────────────
+# ── List packages ─────────────────────────────────────────────────────────────
 list_deps() {
   case "$DISTRO" in
     *debian*|*ubuntu*)
@@ -57,7 +57,7 @@ list_deps() {
   esac
   echo ""
   echo "  Python packages (isolated venv):"
-  echo "  openpyxl, weasyprint"
+  echo "  openpyxl, flask"
   echo ""
   echo "  Tools (installed to /usr/local/bin):"
   echo "  syft, grype"
@@ -143,28 +143,38 @@ if [ ! -d "$INSTALL_DIR/venv" ]; then
   python3 -m venv "$INSTALL_DIR/venv"
 fi
 echo "[*] Installing Python packages..."
-"$INSTALL_DIR/venv/bin/pip" install --quiet openpyxl weasyprint
+"$INSTALL_DIR/venv/bin/pip" install --quiet openpyxl flask
 echo "[✓] Python packages installed"
 
 # ── Download scripts ──────────────────────────────────────────────────────────
 echo "[*] Downloading scripts..."
-curl -fsSL "$REPO_RAW/scan.sh"                -o "$INSTALL_DIR/scan.sh"
-curl -fsSL "$REPO_RAW/generate_report.py"     -o "$INSTALL_DIR/generate_report.py"
-curl -fsSL "$REPO_RAW/generate_pdf_report.py" -o "$INSTALL_DIR/generate_pdf_report.py"
+curl -fsSL "$REPO_RAW/scan.sh"             -o "$INSTALL_DIR/scan.sh"
+curl -fsSL "$REPO_RAW/generate_report.py"  -o "$INSTALL_DIR/generate_report.py"
+curl -fsSL "$REPO_RAW/webserver.py"        -o "$INSTALL_DIR/webserver.py"
 chmod +x "$INSTALL_DIR/scan.sh"
 
 # ── Wrapper: scan-and-report ──────────────────────────────────────────────────
 cat > /usr/local/bin/scan-and-report <<WRAPPER
 #!/usr/bin/env bash
 OUTPUT_DIR="\${1:-/tmp/scan_output}"
-BASENAME="\${2:-/tmp/security_report}"
-sudo bash $INSTALL_DIR/scan.sh "\$OUTPUT_DIR"
-$INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/generate_report.py     "\$OUTPUT_DIR" "\${BASENAME}.xlsx"
-$INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/generate_pdf_report.py "\$OUTPUT_DIR" "\${BASENAME}.pdf"
+REPORT="\${2:-/tmp/security_report.xlsx}"
+PORT="\${3:-5000}"
+
+HOST_IP=\$(hostname -I | awk '{print \$1}')
 echo ""
-echo "[✓] Reports ready:"
-echo "    Excel : \${BASENAME}.xlsx"
-echo "    PDF   : \${BASENAME}.pdf"
+echo "════════════════════════════════════════════"
+echo " VulnScanner starting..."
+echo " Open your browser at: http://\${HOST_IP}:\${PORT}"
+echo " Scan output : \$OUTPUT_DIR"
+echo " Report      : \$REPORT"
+echo "════════════════════════════════════════════"
+echo ""
+
+SCAN_DIR="\$OUTPUT_DIR" \
+REPORT_PATH="\$REPORT" \
+INSTALL_DIR="$INSTALL_DIR" \
+PORT="\$PORT" \
+$INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/webserver.py
 WRAPPER
 chmod +x /usr/local/bin/scan-and-report
 
@@ -172,11 +182,6 @@ chmod +x /usr/local/bin/scan-and-report
 echo "[*] Updating Grype vulnerability database..."
 grype db update
 
-# ── Run scan ──────────────────────────────────────────────────────────────────
-echo "[*] Starting scan..."
+# ── Run ───────────────────────────────────────────────────────────────────────
+echo "[*] Starting scan and web UI..."
 scan-and-report
-
-echo ""
-echo "════════════════════════════════════════════"
-echo " Done. Re-run anytime with: scan-and-report"
-echo "════════════════════════════════════════════"
