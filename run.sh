@@ -46,7 +46,11 @@ fi
 command -v syft  &>/dev/null  || NEED_SYFT=true
 command -v grype &>/dev/null  || NEED_GRYPE=true
 
-[ ! -d "$INSTALL_DIR/venv" ] && NEED_VENV=true
+if [ ! -d "$INSTALL_DIR/venv" ]; then
+  NEED_VENV=true
+elif ! "$INSTALL_DIR/venv/bin/pip" show openpyxl flask &>/dev/null 2>&1; then
+  NEED_VENV=true
+fi
 [ ! -f "$INSTALL_DIR/webserver.py" ] && NEED_SCRIPTS=true
 
 # ── Nothing to do path ───────────────────────────────────────────────────────
