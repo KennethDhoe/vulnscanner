@@ -222,31 +222,16 @@ def status():
             "stage":   state["stage"],
         })
 
-@app.route("/stream")
-def stream():
-    def generate():
-        sent = 0
-        # Send a keepalive comment immediately so the browser knows the connection is alive
-        yield ": connected\n\n"
-        while True:
-            with state_lock:
-                lines   = state["log"][sent:]
-                sent   += len(lines)
-                done    = state["done"]
-            for line in lines:
-                # Escape newlines in SSE data field
-                safe = line.replace("\n", " ")
-                yield f"data: {safe}\n\n"
-            if done and not lines:
-                yield "event: done\ndata: \n\n"
-                break
-            # Send keepalive every cycle so connection stays alive during slow phases
-            yield ": ping\n\n"
-            time.sleep(0.5)
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no",
-                             "Connection": "keep-alive"})
+@app.route("/log")
+def get_log():
+    with state_lock:
+        return jsonify({
+            "lines":   state["log"],
+            "done":    state["done"],
+            "running": state["running"],
+            "error":   state["error"],
+            "stage":   state["stage"],
+        })
 
 @app.route("/summary")
 def summary():
@@ -576,10 +561,10 @@ PAGE = """<!DOCTYPE html>
 </div>
 
 <script>
-let allVulns   = [];
-let autoscroll = true;
-let evtSource  = null;
-let logReady   = false;
+let allVulns    = [];
+let autoscroll  = true;
+let pollTimer   = null;
+let lastLineIdx = 0;
 
 const STAGE_ORDER = ['meta','syft','grype','containers','report','done'];
 
@@ -589,16 +574,15 @@ window.onload = () => {
     'Host: <span>' + location.hostname + '</span>';
   fetch('/status').then(r => r.json()).then(d => {
     if (d.running) {
-      // Scan already in progress — jump straight to scan screen and reconnect
+      // Scan already in progress — jump straight to scan screen and resume polling
       document.getElementById('screen-home').style.display = 'none';
       document.getElementById('screen-scan').style.display = '';
       document.getElementById('results-panel').style.display = 'none';
-      document.getElementById('log-box').innerHTML =
-        '<span style="color:#555">Reconnecting to running scan...</span>';
-      logReady = false;
+      document.getElementById('log-box').innerHTML = '';
+      lastLineIdx = 0;
       setBadge('running');
       setProgress(d.stage || 'syft', getStagePercent(d.stage), getStageName(d.stage));
-      connectStream();
+      startPolling();
     } else if (d.done) {
       // Previous scan finished — show results button
       document.getElementById('results-btn').style.display = '';
@@ -633,13 +617,11 @@ function showResults() {
 // ── Start scan ───────────────────────────────────────────────────────────────
 function startScan() {
   document.getElementById('start-btn').disabled = true;
-  // Switch screen immediately
   document.getElementById('screen-home').style.display = 'none';
   document.getElementById('screen-scan').style.display = '';
   document.getElementById('results-panel').style.display = 'none';
-  document.getElementById('log-box').innerHTML =
-    '<span style="color:#333">Connecting...</span>';
-  logReady = false;
+  document.getElementById('log-box').innerHTML = '';
+  lastLineIdx = 0;
   setProgress('idle', 0, 'Starting scan...');
   setBadge('running');
 
@@ -647,64 +629,55 @@ function startScan() {
     .then(r => r.json())
     .then(d => {
       if (d.error) { alert(d.error); showHome(); return; }
-      connectStream();
+      startPolling();
     })
     .catch(e => { alert('Failed to start: ' + e); showHome(); });
 }
 
-// ── SSE ───────────────────────────────────────────────────────────────────────
-function connectStream() {
-  if (evtSource) evtSource.close();
-  evtSource = new EventSource('/stream');
+// ── Polling ──────────────────────────────────────────────────────────────────
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  lastLineIdx = 0;
+  pollTimer = setInterval(pollLog, 800);
+}
 
-  evtSource.onmessage = (e) => {
-    const line = e.data;
-    if (!line || line.startsWith(': ')) return; // SSE comments/keepalives
+function pollLog() {
+  fetch('/log')
+    .then(r => r.json())
+    .then(d => {
+      // Render any new lines since last poll
+      const newLines = d.lines.slice(lastLineIdx);
+      lastLineIdx = d.lines.length;
 
-    // Clear placeholder on first real message of any kind
-    if (!logReady) {
-      document.getElementById('log-box').innerHTML = '';
-      logReady = true;
-    }
+      newLines.forEach(line => {
+        if (line.startsWith('__STAGE__')) {
+          const parts = line.split('__').filter(Boolean);
+          const stage = parts[1];
+          const pct   = parseInt(parts[2]);
+          const label = parts[3];
+          setProgress(stage, pct, label);
+          appendLog('▶ ' + label, 'stage');
+        } else {
+          appendLog(line);
+        }
+      });
 
-    // Stage control messages
-    if (line.startsWith('__STAGE__')) {
-      const parts = line.split('__').filter(Boolean);
-      const stage = parts[1];
-      const pct   = parseInt(parts[2]);
-      const label = parts[3];
-      setProgress(stage, pct, label);
-      appendLog('▶ ' + label, 'stage');
-      return;
-    }
-
-    appendLog(line);
-  };
-
-  evtSource.addEventListener('done', () => {
-    evtSource.close();
-    fetch('/status').then(r => r.json()).then(d => {
-      if (d.error) {
-        setBadge('error');
-        setProgress('done', 100, 'Finished with errors');
-      } else {
-        setBadge('done');
-        setProgress('done', 100, 'Complete');
-        document.getElementById('results-panel').style.display = '';
-        loadSummary();
+      // Scan finished
+      if (d.done) {
+        clearInterval(pollTimer);
+        if (d.error) {
+          setBadge('error');
+          setProgress('done', 100, 'Finished with errors');
+        } else {
+          setBadge('done');
+          setProgress('done', 100, 'Complete');
+          document.getElementById('results-panel').style.display = '';
+          loadSummary();
+        }
+        document.getElementById('start-btn').disabled = false;
       }
-      document.getElementById('start-btn').disabled = false;
-    });
-  });
-
-  evtSource.onerror = () => {
-    // Try to reconnect once after a short delay
-    setTimeout(() => {
-      fetch('/status').then(r => r.json()).then(d => {
-        if (d.running) connectStream();
-      }).catch(() => {});
-    }, 2000);
-  };
+    })
+    .catch(() => {}); // silently retry next tick
 }
 
 function appendLog(text, cls) {
