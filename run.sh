@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# install.sh — Bootstrap Syft + Grype + Python env for security scanning
+# run.sh — VulnScanner bootstrap
 # Supports: Debian/Ubuntu, RHEL/CentOS/Fedora, Alpine, Arch, SUSE
-# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/KennethDhoe/vulnscanner/main/install.sh)
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/KennethDhoe/vulnscanner/main/run.sh)
 
 set -euo pipefail
 
@@ -26,45 +26,56 @@ detect_distro() {
 DISTRO=$(detect_distro)
 echo "[*] Detected distro family: $DISTRO"
 
-# ── List packages ─────────────────────────────────────────────────────────────
-list_deps() {
-  case "$DISTRO" in
-    *debian*|*ubuntu*)
-      echo "  curl, python3, python3-pip, python3-full, python3-venv"
-      echo "  libpango-1.0-0, libpangoft2-1.0-0, libpangocairo-1.0-0"
-      echo "  libgdk-pixbuf2.0-0, libffi-dev, shared-mime-info, fonts-liberation"
-      ;;
-    *fedora*|*rhel*|*centos*)
-      echo "  curl, python3, python3-pip, python3-virtualenv"
-      echo "  pango, gdk-pixbuf2, libffi, shared-mime-info"
-      echo "  levien-inconsolata-fonts, google-noto-fonts-common"
-      ;;
-    *alpine*)
-      echo "  curl, python3, py3-pip, py3-virtualenv"
-      echo "  pango, gdk-pixbuf, fontconfig, ttf-liberation, shared-mime-info"
-      ;;
-    *arch*)
-      echo "  curl, python, python-pip, python-virtualenv"
-      echo "  pango, gdk-pixbuf2, shared-mime-info, ttf-liberation"
-      ;;
-    *suse*|*opensuse*)
-      echo "  curl, python3, python3-pip, python3-virtualenv"
-      echo "  pango, gdk-pixbuf, libffi, shared-mime-info, fonts-liberation2"
-      ;;
-    *)
-      echo "  curl, python3, python3-venv, pango, gdk-pixbuf, libffi"
-      ;;
-  esac
-  echo ""
-  echo "  Python packages (isolated venv):"
-  echo "  openpyxl, flask"
-  echo ""
-  echo "  Tools (installed to /usr/local/bin):"
-  echo "  syft, grype"
-}
+# ── Check what's already installed ───────────────────────────────────────────
+NEED_SYSDEPS=false
+NEED_SYFT=false
+NEED_GRYPE=false
+NEED_VENV=false
+NEED_SCRIPTS=false
+
+# System deps: check for the key ones (python3 + venv)
+if ! command -v python3 &>/dev/null || ! python3 -m venv --help &>/dev/null 2>&1; then
+  NEED_SYSDEPS=true
+fi
+
+command -v syft  &>/dev/null  || NEED_SYFT=true
+command -v grype &>/dev/null  || NEED_GRYPE=true
+
+[ ! -d "$INSTALL_DIR/venv" ] && NEED_VENV=true
+[ ! -f "$INSTALL_DIR/webserver.py" ] && NEED_SCRIPTS=true
+
+# ── Nothing to do path ───────────────────────────────────────────────────────
+if ! $NEED_SYSDEPS && ! $NEED_SYFT && ! $NEED_GRYPE && ! $NEED_VENV && ! $NEED_SCRIPTS; then
+  echo "[✓] All dependencies already installed, skipping setup."
+  echo "[*] Starting VulnScanner..."
+  scan-and-report
+  exit 0
+fi
+
+# ── Show what needs installing ────────────────────────────────────────────────
+echo ""
+echo "The following will be installed:"
+echo "────────────────────────────────────────────────"
+$NEED_SYSDEPS  && echo "  [new] System packages (python3, venv, pango, fonts, ...)"
+$NEED_SYFT     && echo "  [new] syft"
+$NEED_GRYPE    && echo "  [new] grype"
+$NEED_VENV     && echo "  [new] Python venv + openpyxl, flask"
+$NEED_SCRIPTS  && echo "  [new] VulnScanner scripts → $INSTALL_DIR"
+! $NEED_SYSDEPS && echo "  [ok]  System packages"
+! $NEED_SYFT    && echo "  [ok]  syft ($(syft version 2>/dev/null | head -1))"
+! $NEED_GRYPE   && echo "  [ok]  grype ($(grype version 2>/dev/null | head -1))"
+! $NEED_VENV    && echo "  [ok]  Python venv"
+! $NEED_SCRIPTS && echo "  [ok]  VulnScanner scripts"
+echo "────────────────────────────────────────────────"
+read -r -p "Continue? [y/N] " confirm
+case "$confirm" in
+  [yY][eE][sS]|[yY]) ;;
+  *) echo "Aborted."; exit 1 ;;
+esac
 
 # ── Install system packages ───────────────────────────────────────────────────
-install_deps() {
+if $NEED_SYSDEPS; then
+  echo "[*] Installing system dependencies..."
   case "$DISTRO" in
     *debian*|*ubuntu*)
       apt-get update -qq
@@ -96,64 +107,58 @@ install_deps() {
         pango gdk-pixbuf libffi shared-mime-info fonts-liberation2
       ;;
     *)
-      echo "[!] Unknown distro — skipping system package install."
+      echo "[!] Unknown distro — skipping system packages."
       echo "    Install manually: curl, python3, python3-venv, pango, gdk-pixbuf, libffi"
       ;;
   esac
-}
-
-# ── Confirm before proceeding ─────────────────────────────────────────────────
-echo ""
-echo "The following will be installed on this system:"
-echo "────────────────────────────────────────────────"
-list_deps
-echo "────────────────────────────────────────────────"
-read -r -p "Continue? [y/N] " confirm
-case "$confirm" in
-  [yY][eE][sS]|[yY]) ;;
-  *) echo "Aborted."; exit 1 ;;
-esac
-
-echo "[*] Installing system dependencies..."
-install_deps
-echo "[✓] System dependencies installed"
+  echo "[✓] System dependencies installed"
+else
+  echo "[✓] System dependencies already present"
+fi
 
 # ── Syft ─────────────────────────────────────────────────────────────────────
-if command -v syft &>/dev/null; then
-  echo "[✓] Syft already installed: $(syft version | head -1)"
-else
+if $NEED_SYFT; then
   echo "[*] Installing Syft..."
   curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
   echo "[✓] Syft installed: $(syft version | head -1)"
+else
+  echo "[✓] Syft already installed: $(syft version | head -1)"
 fi
 
 # ── Grype ────────────────────────────────────────────────────────────────────
-if command -v grype &>/dev/null; then
-  echo "[✓] Grype already installed: $(grype version | head -1)"
-else
+if $NEED_GRYPE; then
   echo "[*] Installing Grype..."
   curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
   echo "[✓] Grype installed: $(grype version | head -1)"
+else
+  echo "[✓] Grype already installed: $(grype version | head -1)"
 fi
 
 # ── Python venv + packages ────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
-if [ ! -d "$INSTALL_DIR/venv" ]; then
+if $NEED_VENV; then
   echo "[*] Creating Python venv..."
   python3 -m venv "$INSTALL_DIR/venv"
+  echo "[*] Installing Python packages..."
+  "$INSTALL_DIR/venv/bin/pip" install --quiet openpyxl flask
+  echo "[✓] Python packages installed"
+else
+  echo "[✓] Python venv already present"
 fi
-echo "[*] Installing Python packages..."
-"$INSTALL_DIR/venv/bin/pip" install --quiet openpyxl flask
-echo "[✓] Python packages installed"
 
 # ── Download scripts ──────────────────────────────────────────────────────────
-echo "[*] Downloading scripts..."
-curl -fsSL "$REPO_RAW/scan.sh"             -o "$INSTALL_DIR/scan.sh"
-curl -fsSL "$REPO_RAW/generate_report.py"  -o "$INSTALL_DIR/generate_report.py"
-curl -fsSL "$REPO_RAW/webserver.py"        -o "$INSTALL_DIR/webserver.py"
-chmod +x "$INSTALL_DIR/scan.sh"
+if $NEED_SCRIPTS; then
+  echo "[*] Downloading VulnScanner scripts..."
+  curl -fsSL "$REPO_RAW/scan.sh"            -o "$INSTALL_DIR/scan.sh"
+  curl -fsSL "$REPO_RAW/generate_report.py" -o "$INSTALL_DIR/generate_report.py"
+  curl -fsSL "$REPO_RAW/webserver.py"       -o "$INSTALL_DIR/webserver.py"
+  chmod +x "$INSTALL_DIR/scan.sh"
+  echo "[✓] Scripts downloaded"
+else
+  echo "[✓] Scripts already present"
+fi
 
-# ── Wrapper: scan-and-report ──────────────────────────────────────────────────
+# ── Wrapper ───────────────────────────────────────────────────────────────────
 cat > /usr/local/bin/scan-and-report <<WRAPPER
 #!/usr/bin/env bash
 OUTPUT_DIR="\${1:-/tmp/scan_output}"
@@ -172,6 +177,6 @@ chmod +x /usr/local/bin/scan-and-report
 echo "[*] Updating Grype vulnerability database..."
 grype db update
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-echo "[*] Starting scan and web UI..."
+# ── Launch ────────────────────────────────────────────────────────────────────
+echo "[*] Starting VulnScanner..."
 scan-and-report
