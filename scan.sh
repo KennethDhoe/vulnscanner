@@ -22,8 +22,7 @@ echo "[*] Collecting host metadata..."
 
 # ── Host SBOM (Syft) ─────────────────────────────────────────────────────────
 echo "[*] Scanning host filesystem with Syft..."
-syft scan dir:/ \
-  --override-default-catalogers dpkg,rpm,apk,java,python,javascript,dotnet \
+syft scan dir:/var/lib/dpkg dir:/var/lib/rpm dir:/lib/apk \
   -o syft-json \
   > "$OUTPUT_DIR/host_sbom.json"
 
