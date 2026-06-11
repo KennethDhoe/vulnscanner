@@ -160,16 +160,6 @@ OUTPUT_DIR="\${1:-/tmp/scan_output}"
 REPORT="\${2:-/tmp/security_report.xlsx}"
 PORT="\${3:-5000}"
 
-HOST_IP=\$(hostname -I | awk '{print \$1}')
-echo ""
-echo "════════════════════════════════════════════"
-echo " VulnScanner starting..."
-echo " Open your browser at: http://\${HOST_IP}:\${PORT}"
-echo " Scan output : \$OUTPUT_DIR"
-echo " Report      : \$REPORT"
-echo "════════════════════════════════════════════"
-echo ""
-
 SCAN_DIR="\$OUTPUT_DIR" \
 REPORT_PATH="\$REPORT" \
 INSTALL_DIR="$INSTALL_DIR" \
