@@ -133,3 +133,7 @@ echo ""
 echo " Run a full scan:   scan-and-report"
 echo " Custom paths:      scan-and-report /tmp/out /tmp/my_report"
 echo "════════════════════════════════════════════"
+
+# ── Run scan ──────────────────────────────────────────────────────────────────
+echo "[*] Starting scan..."
+scan-and-report
