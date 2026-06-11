@@ -89,7 +89,7 @@ if $NEED_SYSDEPS; then
     *debian*|*ubuntu*)
       apt-get update -qq
       apt-get install -y \
-        curl python3 python3-pip python3-full python3-venv \
+        curl python3 python3-pip python3-venv \
         libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
         libgdk-pixbuf2.0-0 libffi-dev shared-mime-info fonts-liberation
       ;;
